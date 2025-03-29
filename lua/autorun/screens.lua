@@ -639,7 +639,6 @@ local function render_screens()
     render.SetStencilPassOperation( STENCILOPERATION_REPLACE )
     render.SetStencilFailOperation( STENCILOPERATION_KEEP )
     render.SetStencilZFailOperation( STENCILOPERATION_KEEP )
-    render.SetStencilReferenceValue( 1 )
 
     render.PushFilterMag( TEXFILTER.ANISOTROPIC )
     render.PushFilterMin( TEXFILTER.ANISOTROPIC )
