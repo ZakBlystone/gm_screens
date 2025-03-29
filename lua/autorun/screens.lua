@@ -8,6 +8,8 @@ module("screens", package.seeall)
 
 local function vec_new() return {0,0,0} end
 local function vec_set(v, ...) v[1], v[2], v[3] = ... end
+local function vec_dot(a, b) return a[1] * b[1] + a[2] * b[2] + a[3] * b[3] end
+local function vec_len(a) return math.sqrt(vec_dot(a,a)) end
 local function vec_ma(v, a, s, o)
 
     o[1] = v[1] + a[1] * s
@@ -52,15 +54,64 @@ local function make_screen_state()
         zoffset = 0,               -- z offset of screen
         to_world = mtx_new(),      -- screen-to-world matrix
         to_screen = mtx_new(),     -- world-to-screen matrix
+        behind = false,            -- camera is behind screen
+        first_command = 0,         -- first command to process for rendering
+        last_command = 0,          -- last command to process for rendering
     }
 
 end
 
+local command_list = {}
 local screen_states = {}
 for i=1, 4096 do screen_states[i] = make_screen_state() end
 
 local PASS_COMPUTE = 1
 local PASS_EXECUTE = 2
+local PASS_ALL = 0xFF
+local PASS_COUNT = 2
+
+local CMD_RESET = 0
+local CMD_SETCOLOR = 1
+local CMD_SETFONT = 2
+local CMD_DRAWRECT = 3
+local CMD_TEXT = 4
+
+local draw_state = {
+    color = {255,255,255,255},
+    font = "DermaDefault",
+}
+
+local command_functors = {
+    [CMD_RESET] = function(cmd)
+        for i=1, 4 do draw_state.color[i] = 255 end
+        draw_state.font = "DermaDefault"
+    end,
+    [CMD_SETCOLOR] = function(cmd)
+        draw_state.color[1] = cmd.r
+        draw_state.color[2] = cmd.g
+        draw_state.color[3] = cmd.b
+        draw_state.color[4] = cmd.a
+    end,
+    [CMD_SETFONT] = function(cmd)
+        draw_state.font = cmd.font
+    end,
+    [CMD_DRAWRECT] = function(cmd)
+        surface.SetDrawColor(unpack(draw_state.color))
+        surface.DrawRect(cmd.x, cmd.y, cmd.w, cmd.h)
+    end,
+    [CMD_TEXT] = function(cmd)
+        surface.SetFont(draw_state.font)
+        surface.SetTextColor(unpack(draw_state.color))
+        local w,h = surface.GetTextSize(cmd.str)
+        local x,y = cmd.x, cmd.y
+        if cmd.xalign == TEXT_ALIGN_CENTER then x = x - w/2
+        elseif cmd.xalign == TEXT_ALIGN_RIGHT then x = x - w end
+        if cmd.yalign == TEXT_ALIGN_CENTER then y = y - h/2
+        elseif cmd.yalign == TEXT_ALIGN_BOTTOM then y = y - h end
+        surface.SetTextPos(x, y)
+        surface.DrawText(cmd.str)
+    end,
+}
 
 local system_state = {
     eye_pos = vec_new(),        -- camera position
@@ -72,6 +123,18 @@ local system_state = {
     screen_state = nil,         -- the current screen being processed
     screen_interact = nil,      -- the current screen being interacted with
     screen_interact_prev = nil, -- the previous screen being interacted with
+    num_processed = 0,          -- number of screens processed
+    num_rendered = 0,           -- number of screens rendered (all passes)
+    num_commands = 0,           -- number of queued commands
+    command_list = {},          -- command list
+}
+
+local trace_result_table = {}
+local trace_table = {
+    start = Vector(),
+    endpos = Vector(),
+    filter = {},
+    output = trace_result_table,
 }
 
 local function compute_screen_matrices(state)
@@ -143,6 +206,7 @@ local function compute_screen_trace(state, local_out)
     mtx_vmul(state.to_screen, system_state.eye_dir, 0, trace_dir)
 
     if trace_org[3] - 1e-4 < 0 then
+        if not local_out then state.behind = true end
         state.trace_toi = math.huge -- didn't hit front
         return
     else
@@ -199,9 +263,32 @@ local function pop_screenmode()
 
 end
 
+local function alloc_command(cmd)
+
+    local n = system_state.num_commands + 1
+    local tbl = system_state.command_list[n] or {}
+    tbl.cmd = cmd
+    system_state.command_list[n] = tbl
+    system_state.num_commands = n
+
+    return tbl
+
+end
+
+local function process_command(cmd)
+
+    local functor = command_functors[cmd.cmd]
+    if functor then
+        local b,e = pcall(functor, cmd)
+        if not b then print(e) end
+    else
+        ErrorNoHalt("NO FUNCTOR FOR COMMAND: " .. tostring(cmd.cmd))
+    end
+
+end
 
 local render_mtx = Matrix()
-function start(position, rotation, width, height, owning_entity)
+local function scr_start(position, rotation, width, height, owning_entity)
 
     local unfinished = system_state.screen_state ~= nil
     local idx = system_state.screen_index
@@ -220,68 +307,73 @@ function start(position, rotation, width, height, owning_entity)
         state.xanchor = 0
         state.yanchor = 0
         state.zoffset = 0
+        state.behind = false
         vec_set(state.position, position:Unpack())
         vec_set(state.rotation, rotation:Unpack())
-        return false
+        return true
 
     elseif system_state.pass == PASS_EXECUTE then
 
-        if not state.valid then
-            system_state.screen_state = nil
-            return false
-        end
-
-        render_mtx:SetUnpacked( unpack(state.to_world) )
-        cam.PushModelMatrix(render_mtx, true)
-        push_screenmode(state.xres, state.yres)
+        alloc_command(CMD_RESET)
+        state.first_command = system_state.num_commands
         return true
 
     end
 
 end
 
-function finish()
+local function scr_finish()
 
     if system_state.screen_state ~= nil then
 
         local state = system_state.screen_state
         if system_state.pass == PASS_COMPUTE then
+
+            system_state.num_processed = system_state.num_processed + 1
             system_state.screen_state.valid = true
             compute_screen_matrices(state)
             compute_screen_trace(state)
-        elseif system_state.pass == PASS_EXECUTE then
-            pop_screenmode()
-            cam.PopModelMatrix()
-        end
+            system_state.screen_state = nil
+            system_state.screen_index = system_state.screen_index + 1
 
-        system_state.screen_state = nil
-        system_state.screen_index = system_state.screen_index + 1
+        elseif system_state.pass == PASS_EXECUTE then
+
+            state.last_command = system_state.num_commands
+            system_state.screen_state = nil
+            system_state.screen_index = system_state.screen_index + 1
+
+        end
 
     end
 
 end
 
-function set_anchor(x,y)
+local function scr_set_anchor(x,y,z_offset)
 
     local state = system_state.screen_state
-    if not state or system_state.pass ~= PASS_COMPUTE then return end
+    if not state then return end
 
     state.xanchor = tonumber(x)
     state.yanchor = tonumber(y)
+    if z_offset then
+        state.zoffset = tonumber(z_offset)
+    else
+        state.zoffset = 0
+    end
 
 end
 
-function set_res(xres, yres)
+local function scr_set_res(xres, yres)
 
     local state = system_state.screen_state
-    if not state or system_state.pass ~= PASS_COMPUTE then return end
+    if not state then return end
 
     state.xres = tonumber(xres)
     state.yres = tonumber(yres)
 
 end
 
-function get_res(xres, yres)
+local function scr_get_res(xres, yres)
 
     local state = system_state.screen_state
     if not state then return 0,0 end
@@ -290,55 +382,166 @@ function get_res(xres, yres)
 
 end
 
-function get_cursor()
+local function scr_get_cursor()
 
     local state = system_state.screen_state
-    if not state or system_state.pass ~= PASS_EXECUTE then return 0,0 end
+    if not state then return 0,0 end
 
     return unpack(state.cursor)
 
 end
 
-function is_interacting()
+local function scr_is_interacting()
 
     local state = system_state.screen_state
-    if not state or system_state.pass ~= PASS_EXECUTE then return false end
+    if not state then return 0,0 end
 
     return system_state.screen_interact == state
 
 end
 
-function has_started_interacting()
+local function scr_has_entered()
 
     local state = system_state.screen_state
-    if not state or system_state.pass ~= PASS_EXECUTE then return false end
-
     return system_state.screen_interact_prev ~= state and 
            system_state.screen_interact == state
 
 end
 
-function has_stopped_interacting()
+local function scr_has_exited()
 
     local state = system_state.screen_state
-    if not state or system_state.pass ~= PASS_EXECUTE then return false end
-
     return system_state.screen_interact_prev == state and 
            system_state.screen_interact ~= state
 
 end
 
-hook.Add("PreDrawEffects", "hi", function()
+local function scr_set_color(r, g, b, a)
 
-    local origin = EyePos()
-    local angles = EyeAngles()
-    vec_set(system_state.eye_pos, origin:Unpack())
-    vec_set(system_state.eye_dir, angles:Forward():Unpack())
+    if type(r) == "table" then r,g,b,a = r.r, r.g, r.b, r.a end
+
+    local cmd = alloc_command(CMD_SETCOLOR)
+    cmd.r = r
+    cmd.g = g
+    cmd.b = b
+    cmd.a = a
+
+    return true
+
+end
+
+local function scr_rect(x, y, w, h)
+
+    local cmd = alloc_command(CMD_DRAWRECT)
+    cmd.x = x
+    cmd.y = y
+    cmd.w = w
+    cmd.h = h
+
+end
+
+local function scr_font(font)
+
+    local cmd = alloc_command(CMD_SETFONT)
+    cmd.font = font
+
+    return true
+
+end
+
+local function scr_text(str, x, y, xalign, yalign)
+
+    local cmd = alloc_command(CMD_TEXT)
+    cmd.str = str
+    cmd.x = x
+    cmd.y = y
+    cmd.xalign = xalign or TEXT_ALIGN_LEFT
+    cmd.yalign = yalign or TEXT_ALIGN_TOP
+
+    return true
+
+end
+
+local function create_nop(...)
+    local t = {...}
+    return function() return unpack(t) end 
+end
+
+-- hook pass matrix
+local apis = {}
+local function api_register(name, func, passes, ...)
+
+    for i=0, PASS_COUNT-1 do
+        local idx = bit.lshift(1, i)
+        apis[idx] = apis[idx] or {}
+        apis[idx][name] = bit.band(passes, idx) ~= 0 and func or create_nop(...)
+    end
+
+end
+
+api_register("start", scr_start, PASS_ALL)
+api_register("finish", scr_finish, PASS_ALL)
+api_register("set_anchor", scr_set_anchor, PASS_COMPUTE)
+api_register("set_res", scr_set_res, PASS_COMPUTE)
+api_register("get_res", scr_get_res, PASS_ALL)
+api_register("get_cursor", scr_get_cursor, PASS_EXECUTE, 0, 0)
+api_register("is_interacting", scr_is_interacting, PASS_EXECUTE, false)
+api_register("has_entered", scr_has_entered, PASS_EXECUTE, false)
+api_register("has_exited", scr_has_exited, PASS_EXECUTE, false)
+api_register("set_color", scr_set_color, PASS_EXECUTE)
+api_register("rect", scr_rect, PASS_EXECUTE)
+api_register("font", scr_font, PASS_EXECUTE)
+api_register("text", scr_text, PASS_EXECUTE)
+
+local function run_pass(pass)
 
     system_state.screen_index = 1
-    system_state.pass = PASS_COMPUTE
+    system_state.pass = pass
 
-    hook.Run("ProcessScreens")
+    hook.Run("ProcessScreens", apis[pass])
+
+end
+
+hook.Add("HUDPaint", "hi", function()
+
+    draw.SimpleText(
+        "Screens Processed: " .. system_state.num_processed,
+        "DermaLarge",
+        500, 0)
+
+    draw.SimpleText(
+        "Screens Rendered: " .. system_state.num_rendered,
+        "DermaLarge",
+        500, 30)
+
+    draw.SimpleText(
+        "Commands Queued: " .. system_state.num_commands,
+        "DermaLarge",
+        500, 60)
+
+end)
+
+hook.Add("PreDrawEffects", "hi", function() end)
+hook.Add("PreRender", "hi", function()
+    system_state.num_processed = 0
+    system_state.num_rendered = 0
+    system_state.first_view = true
+    --print("BEGIN RENDER:")
+end)
+
+local function process_screens(view)
+
+    local eye_pos = view.origin 
+    local eye_dir = view.angles:Forward()
+
+    if vgui.CursorVisible() then
+        eye_dir = gui.ScreenToVector(gui.MousePos())
+    end
+
+    vec_set(system_state.eye_pos, eye_pos:Unpack())
+    vec_set(system_state.eye_dir, eye_dir:Unpack())
+
+    run_pass(PASS_COMPUTE)
 
     -- find the screen we're most likely interacting with
     local closest_screen = nil
@@ -358,62 +561,132 @@ hook.Add("PreDrawEffects", "hi", function()
             closest_screen.to_world, 
             closest_screen.cursor, 1, 
             closest_screen.world_cursor)
+
+        trace_table.start = eye_pos
+        trace_table.mask = 1
+        trace_table.endpos:SetUnpacked(unpack(closest_screen.world_cursor))
+        trace_table.filter[1] = LocalPlayer()
+        trace_table.filter[2] = closest_screen.owning_entity
+        local tr = util.TraceLine(trace_table)
+        if tr.Fraction ~= 1.0 then closest_screen = nil end
     end
 
     system_state.screen_interact_prev = system_state.screen_interact
     system_state.screen_interact = closest_screen
+    system_state.num_commands = 0
 
-    system_state.screen_index = 1
-    system_state.pass = PASS_EXECUTE
+    run_pass(PASS_EXECUTE)
 
-    hook.Run("ProcessScreens")
+end
+
+local function render_screens()
+
+    render.SetStencilEnable(true)
+    render.SetStencilReferenceValue( 1 )
+    render.SetStencilWriteMask( 1 )
+    render.SetStencilTestMask( 1 )
+    render.SetStencilPassOperation( STENCILOPERATION_REPLACE )
+    render.SetStencilFailOperation( STENCILOPERATION_KEEP )
+    render.SetStencilZFailOperation( STENCILOPERATION_KEEP )
+    render.SetStencilReferenceValue( 1 )
+
+    render.PushFilterMag( TEXFILTER.ANISOTROPIC )
+    render.PushFilterMin( TEXFILTER.ANISOTROPIC )
+
+    for i=1, system_state.screen_index-1 do
+
+        local state = screen_states[i]
+        if not state.valid then continue end
+        if state.behind then continue end
+
+        render_mtx:SetUnpacked( unpack(state.to_world) )
+        cam.PushModelMatrix(render_mtx, true)
+
+        render.ClearStencil()
+        render.SetStencilCompareFunction( STENCILCOMPARISONFUNCTION_ALWAYS )
+        render.OverrideDepthEnable( true, true )
+        render.OverrideColorWriteEnable( true, false )
+        render.SetColorMaterial()
+        surface.SetDrawColor(0, 0, 0, 1)
+        surface.DrawRect(0, 0, state.xres, state.yres )
+        render.OverrideColorWriteEnable( false, false )
+        render.OverrideDepthEnable( false, false )
+        render.SetStencilCompareFunction( STENCILCOMPARISONFUNCTION_EQUAL )
+        cam.IgnoreZ(true)
+
+        for j=state.first_command, state.last_command do
+            process_command(system_state.command_list[j])
+        end
+
+        system_state.num_rendered = system_state.num_rendered + 1
+
+        cam.IgnoreZ(false)
+        cam.PopModelMatrix()
+
+    end
+
+    render.PopFilterMag()
+    render.PopFilterMin()
+
+    render.SetStencilEnable(false)
+
+end
+
+hook.Add("PostDrawOpaqueRenderables", "hi", function()
+
+    local view = render.GetViewSetup()
+    if view.viewid == VIEW_3DSKY then return end
+
+    if system_state.first_view then
+
+        system_state.first_view = false
+        process_screens(view)
+
+    end
+
+    render_screens()
 
 end)
 
 local cursor_flash_0 = 0
 local cursor_flash_1 = 0
-hook.Add("ProcessScreens", "hi", function()
+hook.Add("ProcessScreens", "hi", function(s)
 
-    local drawing = start(Vector(0,0,100), Angle(0,0,0), 200, 200)
-    set_anchor(0.5, 0.5)
-    set_res(600,600)
-
-    if drawing then
-
-        local x,y = get_cursor()
-        local r,g,b = 43,64,133
-        if is_interacting() then r,g,b = 80, 196, 70 end
-        if has_started_interacting() then cursor_flash_0 = 1 end
-        if has_stopped_interacting() then cursor_flash_0 = 1 end
-        surface.SetDrawColor(r + cursor_flash_0 * 100,g - cursor_flash_0 * 100,b)
-        surface.DrawRect(0,0,get_res())
-        surface.SetDrawColor(255,255,255)
-        surface.DrawRect(x,y,40,40)
-        cursor_flash_0 = math.max(cursor_flash_0 - FrameTime(), 0)
-
+    local ply = LocalPlayer()
+    for _, ent in ents.Iterator() do
+        if ent:IsDormant() then continue end
+        if ent:GetClass() ~= "prop_physics" then continue end
+        if ent:GetModel() == "models/props_c17/tv_monitor01.mdl" then
+            if s.start(ent:GetPos(), ent:GetAngles(), 15, 10.5, ent) then
+            s.set_res(320,240)
+            s.set_anchor(0.62,0.565,6)
+            local w,h = s.get_res()
+            local interact = s.is_interacting()
+            if interact and ply:KeyPressed(IN_ATTACK) then 
+                ent.__toggle = not ent.__toggle
+                print("TOGGLE")
+            end
+            s.set_color(46,80,120)
+            if ent.__toggle then s.set_color(165,74,71) end
+            if interact then s.set_color(73,197,129) end
+            s.rect(0,0,w,h)
+            if interact then
+                local x,y = s.get_cursor()
+                s.set_color(255,255,255)
+                s.rect(x-10,y-10,20,20)
+            end
+            s.font("DermaLarge")
+            s.set_color(255,255,255)
+            s.text(
+                "Interact: " .. tostring(interact),
+                w/2,
+                h/2,
+                TEXT_ALIGN_CENTER,
+                TEXT_ALIGN_CENTER
+            )
+            s.finish()
+            end
+        end
     end
-
-    finish()
-
-    local drawing = start(Vector(0,0,100), Angle(0,50,0), 200, 200)
-    set_anchor(0.5, 0.5)
-    set_res(600,600)
-
-    if drawing then
-
-        local x,y = get_cursor()
-        local r,g,b = 43,64,133
-        if is_interacting() then r,g,b = 80, 196, 70 end
-        if has_started_interacting() then cursor_flash_1 = 1 end
-        if has_stopped_interacting() then cursor_flash_1 = 1 end
-        surface.SetDrawColor(r + cursor_flash_1 * 100,g - cursor_flash_1 * 100,b)
-        surface.DrawRect(0,0,get_res())
-        surface.SetDrawColor(255,255,255)
-        surface.DrawRect(x,y,40,40)
-        cursor_flash_1 = math.max(cursor_flash_1 - FrameTime(), 0)
-
-    end
-
-    finish()
 
 end)
