@@ -70,21 +70,28 @@ local PASS_EXECUTE = 2
 local PASS_ALL = 0xFF
 local PASS_COUNT = 2
 
+local CMF_NONE = 0
+local CMF_NOREPEAT = 1
+
 local CMD_RESET = 0
 local CMD_SETCOLOR = 1
 local CMD_SETFONT = 2
-local CMD_DRAWRECT = 3
-local CMD_TEXT = 4
+local CMD_SETMATERIAL = 3
+local CMD_DRAWRECT = 4
+local CMD_DRAWIMAGE = 5
+local CMD_TEXT = 6
 
 local draw_state = {
     color = {255,255,255,255},
     font = "DermaDefault",
+    material = nil,
 }
 
 local command_functors = {
     [CMD_RESET] = function(cmd)
         for i=1, 4 do draw_state.color[i] = 255 end
         draw_state.font = "DermaDefault"
+        draw_state.material = nil
     end,
     [CMD_SETCOLOR] = function(cmd)
         draw_state.color[1] = cmd.r
@@ -95,9 +102,21 @@ local command_functors = {
     [CMD_SETFONT] = function(cmd)
         draw_state.font = cmd.font
     end,
+    [CMD_SETMATERIAL] = function(cmd)
+        draw_state.material = cmd.material
+    end,
     [CMD_DRAWRECT] = function(cmd)
         surface.SetDrawColor(unpack(draw_state.color))
         surface.DrawRect(cmd.x, cmd.y, cmd.w, cmd.h)
+    end,
+    [CMD_DRAWIMAGE] = function(cmd)
+        surface.SetDrawColor(unpack(draw_state.color))
+        if cmd.material or draw_state.material then
+            surface.SetMaterial(cmd.material or draw_state.material)
+            surface.DrawTexturedRect(cmd.x, cmd.y, cmd.w, cmd.h)
+        else
+            surface.DrawRect(cmd.x, cmd.y, cmd.w, cmd.h)
+        end
     end,
     [CMD_TEXT] = function(cmd)
         surface.SetFont(draw_state.font)
@@ -116,8 +135,10 @@ local command_functors = {
 local system_state = {
     eye_pos = vec_new(),        -- camera position
     eye_dir = vec_new(),        -- camera forward direction
-    pressed = {0,0},            -- inputs being pressed this frame
-    down = {0,0},               -- inputs being held down this frame
+    pressed = {false,false},    -- inputs being pressed this frame
+    released = {false, false},  -- inputs being released this frame
+    prev_down = {false, false}, -- inputs previous held down
+    down = {false, false},      -- inputs being held down this frame
     pass = 1,                   -- current pass being computed
     screen_index = 1,           -- current index being processed
     screen_state = nil,         -- the current screen being processed
@@ -263,7 +284,15 @@ local function pop_screenmode()
 
 end
 
-local function alloc_command(cmd)
+local function alloc_command(cmd, flags)
+
+    flags = flags or CMF_NONE
+    if bit.band(flags, CMF_NOREPEAT) ~= 0 then
+
+        local last = system_state.command_list[system_state.num_commands]
+        if last and last.cmd == cmd then return last end
+
+    end
 
     local n = system_state.num_commands + 1
     local tbl = system_state.command_list[n] or {}
@@ -310,13 +339,11 @@ local function scr_start(position, rotation, width, height, owning_entity)
         state.behind = false
         vec_set(state.position, position:Unpack())
         vec_set(state.rotation, rotation:Unpack())
-        return true
 
     elseif system_state.pass == PASS_EXECUTE then
 
         alloc_command(CMD_RESET)
         state.first_command = system_state.num_commands
-        return true
 
     end
 
@@ -391,6 +418,27 @@ local function scr_get_cursor()
 
 end
 
+local function scr_is_down(i) 
+    
+    local state = system_state.screen_state
+    return system_state.screen_interact == state and system_state.down[i]
+
+end
+
+local function scr_is_pressed(i) 
+    
+    local state = system_state.screen_state
+    return system_state.screen_interact == state and system_state.pressed[i]
+
+end
+
+local function scr_is_released(i) 
+    
+    local state = system_state.screen_state
+    return system_state.screen_interact == state and system_state.released[i]
+
+end
+
 local function scr_is_interacting()
 
     local state = system_state.screen_state
@@ -420,13 +468,25 @@ local function scr_set_color(r, g, b, a)
 
     if type(r) == "table" then r,g,b,a = r.r, r.g, r.b, r.a end
 
-    local cmd = alloc_command(CMD_SETCOLOR)
+    local cmd = alloc_command(CMD_SETCOLOR, CMF_NOREPEAT)
     cmd.r = r
     cmd.g = g
     cmd.b = b
     cmd.a = a
 
-    return true
+end
+
+local function scr_set_font(font)
+
+    local cmd = alloc_command(CMD_SETFONT, CMF_NOREPEAT)
+    cmd.font = font
+
+end
+
+local function scr_set_material(m)
+
+    local cmd = alloc_command(CMD_SETMATERIAL, CMF_NOREPEAT)
+    cmd.material = m
 
 end
 
@@ -440,12 +500,14 @@ local function scr_rect(x, y, w, h)
 
 end
 
-local function scr_font(font)
+local function scr_image(x, y, w, h, material)
 
-    local cmd = alloc_command(CMD_SETFONT)
-    cmd.font = font
-
-    return true
+    local cmd = alloc_command(CMD_DRAWIMAGE)
+    cmd.x = x
+    cmd.y = y
+    cmd.w = w
+    cmd.h = h
+    cmd.material = material
 
 end
 
@@ -453,12 +515,21 @@ local function scr_text(str, x, y, xalign, yalign)
 
     local cmd = alloc_command(CMD_TEXT)
     cmd.str = str
-    cmd.x = x
-    cmd.y = y
+    cmd.x = x or 0
+    cmd.y = y or 0
     cmd.xalign = xalign or TEXT_ALIGN_LEFT
     cmd.yalign = yalign or TEXT_ALIGN_TOP
 
-    return true
+end
+
+local function scr_text_center(str, x, y)
+
+    local cmd = alloc_command(CMD_TEXT)
+    cmd.str = str
+    cmd.x = x or 0
+    cmd.y = y or 0
+    cmd.xalign = TEXT_ALIGN_CENTER
+    cmd.yalign = TEXT_ALIGN_CENTER
 
 end
 
@@ -486,12 +557,18 @@ api_register("set_res", scr_set_res, PASS_COMPUTE)
 api_register("get_res", scr_get_res, PASS_ALL)
 api_register("get_cursor", scr_get_cursor, PASS_EXECUTE, 0, 0)
 api_register("is_interacting", scr_is_interacting, PASS_EXECUTE, false)
+api_register("is_down", scr_is_down, PASS_EXECUTE, false)
+api_register("is_pressed", scr_is_pressed, PASS_EXECUTE, false)
+api_register("is_released", scr_is_released, PASS_EXECUTE, false)
 api_register("has_entered", scr_has_entered, PASS_EXECUTE, false)
 api_register("has_exited", scr_has_exited, PASS_EXECUTE, false)
 api_register("set_color", scr_set_color, PASS_EXECUTE)
+api_register("set_font", scr_set_font, PASS_EXECUTE)
+api_register("set_material", scr_set_material, PASS_EXECUTE)
 api_register("rect", scr_rect, PASS_EXECUTE)
-api_register("font", scr_font, PASS_EXECUTE)
+api_register("image", scr_image, PASS_EXECUTE)
 api_register("text", scr_text, PASS_EXECUTE)
+api_register("text_center", scr_text_center, PASS_EXECUTE)
 
 local function run_pass(pass)
 
@@ -515,7 +592,7 @@ hook.Add("HUDPaint", "hi", function()
         500, 30)
 
     draw.SimpleText(
-        "Commands Queued: " .. system_state.num_commands,
+        "Render Commands Queued: " .. system_state.num_commands,
         "DermaLarge",
         500, 60)
 
@@ -536,6 +613,21 @@ local function process_screens(view)
 
     if vgui.CursorVisible() then
         eye_dir = gui.ScreenToVector(gui.MousePos())
+    end
+
+    for i=1, 2 do
+        system_state.pressed[i] = false
+        system_state.released[i] = false
+        local prev_down_state = system_state.prev_down[i]
+        local curr_down_state = system_state.down[i]
+        system_state.prev_down[i] = system_state.down[i]
+
+        if prev_down_state == false and curr_down_state == true then
+            system_state.pressed[i] = true
+        end
+        if prev_down_state == true and curr_down_state == false then
+            system_state.released[i] = true
+        end
     end
 
     vec_set(system_state.eye_pos, eye_pos:Unpack())
@@ -636,6 +728,7 @@ hook.Add("PostDrawOpaqueRenderables", "hi", function()
 
     local view = render.GetViewSetup()
     if view.viewid == VIEW_3DSKY then return end
+    if view.viewid ~= 0 then return end
 
     if system_state.first_view then
 
@@ -648,44 +741,62 @@ hook.Add("PostDrawOpaqueRenderables", "hi", function()
 
 end)
 
-local cursor_flash_0 = 0
-local cursor_flash_1 = 0
+hook.Add("PlayerBindPress", "hi", function(ply, bind, pressed, code)
+
+    if bind == "+attack" then
+
+        local interact = system_state.screen_interact
+        if interact then
+            system_state.down[1] = pressed
+            return true
+        end
+
+    end
+
+end)
+
+local lmb_material = Material("gui/lmb.png")
 hook.Add("ProcessScreens", "hi", function(s)
 
+    local t = CurTime()
     local ply = LocalPlayer()
     for _, ent in ents.Iterator() do
         if ent:IsDormant() then continue end
         if ent:GetClass() ~= "prop_physics" then continue end
         if ent:GetModel() == "models/props_c17/tv_monitor01.mdl" then
-            if s.start(ent:GetPos(), ent:GetAngles(), 15, 10.5, ent) then
+
+            s.start(ent:GetPos(), ent:GetAngles(), 15, 10.5, ent)
             s.set_res(320,240)
             s.set_anchor(0.62,0.565,6)
+            local x,y = s.get_cursor()
             local w,h = s.get_res()
             local interact = s.is_interacting()
-            if interact and ply:KeyPressed(IN_ATTACK) then 
+            if s.is_pressed(1) then
                 ent.__toggle = not ent.__toggle
-                print("TOGGLE")
+                ent:EmitSound("buttons/button1.wav")
             end
             s.set_color(46,80,120)
-            if ent.__toggle then s.set_color(165,74,71) end
-            if interact then s.set_color(73,197,129) end
+            if ent.__toggle then 
+                s.set_color(165,74,71)
+                if interact then s.set_color(80,20,20) end
+            elseif interact then
+                s.set_color(73,197,129)
+            end
             s.rect(0,0,w,h)
             if interact then
-                local x,y = s.get_cursor()
                 s.set_color(255,255,255)
-                s.rect(x-10,y-10,20,20)
+                s.image(x-20,y-20,40,40,lmb_material)
             end
-            s.font("DermaLarge")
+            s.set_font("DermaLarge")
             s.set_color(255,255,255)
-            s.text(
-                "Interact: " .. tostring(interact),
-                w/2,
-                h/2,
-                TEXT_ALIGN_CENTER,
-                TEXT_ALIGN_CENTER
-            )
-            s.finish()
+            s.text_center("Toggled: " .. tostring(ent.__toggle or false), w/2, h/2)
+
+            for i=1, 30 do
+                s.rect(i*10, 20 + math.sin(t*4+i) * 10, 8, 8)
             end
+
+            s.finish()
+
         end
     end
 
