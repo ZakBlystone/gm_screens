@@ -243,47 +243,6 @@ local function compute_screen_trace(state, local_out)
 
 end
 
-local function push_screenmode(xres, yres)
-
-    render.ClearStencil()
-    render.SetStencilEnable(true)
-    render.SetStencilCompareFunction( STENCILCOMPARISONFUNCTION_ALWAYS )
-    render.SetStencilReferenceValue( 1 )
-    render.SetStencilWriteMask( 1 )
-    render.SetStencilTestMask( 1 )
-    render.SetStencilPassOperation( STENCILOPERATION_REPLACE )
-    render.SetStencilFailOperation( STENCILOPERATION_KEEP )
-    render.SetStencilZFailOperation( STENCILOPERATION_KEEP )
-
-    render.OverrideDepthEnable( true, true )
-    render.OverrideColorWriteEnable( true, false )
-    render.SetColorMaterial()
-    surface.SetDrawColor(0, 0, 0, 1)
-    surface.DrawRect(0, 0, xres, yres )
-    render.OverrideColorWriteEnable( false, false )
-    render.OverrideDepthEnable( false, false )
-
-    render.SetStencilReferenceValue( 1 )
-    render.SetStencilCompareFunction( STENCILCOMPARISONFUNCTION_EQUAL )
-
-    cam.IgnoreZ(true)
-
-    render.PushFilterMag( TEXFILTER.ANISOTROPIC )
-    render.PushFilterMin( TEXFILTER.ANISOTROPIC )
-
-end
-
-local function pop_screenmode()
-
-    render.PopFilterMag()
-    render.PopFilterMin()
-
-    cam.IgnoreZ(false)
-
-    render.SetStencilEnable(false)
-
-end
-
 local function alloc_command(cmd, flags)
 
     flags = flags or CMF_NONE
