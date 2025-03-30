@@ -30,9 +30,45 @@ end
 
 local function mtx_vmul(m, v, w, o)
 
-    o[1] = v[1] * m[1 ] + v[2] * m[2 ] + v[3] * m[3 ] + w * m[4 ]
-    o[2] = v[1] * m[5 ] + v[2] * m[6 ] + v[3] * m[7 ] + w * m[8 ]
-    o[3] = v[1] * m[9 ] + v[2] * m[10] + v[3] * m[11] + w * m[12]
+    o[1], o[2], o[3] = 
+        v[1] * m[1 ] + v[2] * m[2 ] + v[3] * m[3 ] + w * m[4 ],
+        v[1] * m[5 ] + v[2] * m[6 ] + v[3] * m[7 ] + w * m[8 ],
+        v[1] * m[9 ] + v[2] * m[10] + v[3] * m[11] + w * m[12]
+
+end
+
+function atlas_packer(w, h, pad)
+
+	pad = pad or 0
+    local free = { x=0, y=0, w=w, h=h }
+    return function(width, height)
+
+        local node, prev = free, nil
+        while node ~= nil do
+            if width <= node.w and height <= node.h then break end
+            prev, node = node, node.next
+        end
+        if node == nil then return end
+    
+        local rwidth = node.w - width
+        local rheight = node.h - height
+        local l, r
+    
+        if rwidth >= rheight then
+            l = { x=node.x, y=node.y + height + pad, w=width, h=rheight - pad }
+            r = { x=node.x + width + pad, y=node.y, w=rwidth - pad, h=node.h }
+        else
+            l = { x=node.x + width + pad, y=node.y, w=rwidth - pad, h=height }
+            r = { x=node.x, y=node.y + height + pad, w=node.w, h=rheight - pad }
+        end
+    
+        if prev then prev.next = l else free = l end
+        l.next = r
+        r.next = node.next
+        node.w, node.h, node.next = width, height, nil
+        return node
+
+    end
 
 end
 
@@ -59,6 +95,18 @@ local function make_screen_state()
         behind = false,            -- camera is behind screen
         first_command = 0,         -- first command to process for rendering
         last_command = 0,          -- last command to process for rendering
+        vertices = {
+            vec_new(),
+            vec_new(),
+            vec_new(),
+            vec_new(),
+        },
+        w_vertices = {
+            vec_new(),
+            vec_new(),
+            vec_new(),
+            vec_new(),
+        },
     }
 
 end
@@ -66,6 +114,9 @@ end
 local command_list = {}
 local screen_states = {}
 for i=1, 4096 do screen_states[i] = make_screen_state() end
+
+local USE_RENDERTARGETS = true
+local RENDERTARGET_SIZE = 2048
 
 local PASS_COMPUTE = 1
 local PASS_EXECUTE = 2
@@ -89,6 +140,51 @@ local draw_state = {
     font = "DermaDefault",
     material = nil,
 }
+
+local system_state = {
+    eye_pos = vec_new(),        -- camera position
+    eye_dir = vec_new(),        -- camera forward direction
+    pressed = {false,false},    -- inputs being pressed this frame
+    released = {false, false},  -- inputs being released this frame
+    prev_down = {false, false}, -- inputs previous held down
+    down = {false, false},      -- inputs being held down this frame
+    pass = 1,                   -- current pass being computed
+    screen_index = 1,           -- current index being processed
+    screen_state = nil,         -- the current screen being processed
+    screen_interact = nil,      -- the current screen being interacted with
+    screen_interact_prev = nil, -- the previous screen being interacted with
+    num_processed = 0,          -- number of screens processed
+    num_rendered = 0,           -- number of screens rendered (all passes)
+    num_commands = 0,           -- number of queued commands
+    num_render_passes = 0,      -- number of render passes last frame
+    command_list = {},          -- command list
+    hovered_panel,              -- the currently hovered vgui panel
+    captured_panels = {},       -- panels requesting input capture
+    render_targets = {},        -- cached off-screen rendertargets
+    num_render_targets = 0,     -- number of rendertargets
+    perf_stat_count = {},       -- number of samples for performance counters
+    perf_stat_start = {},       -- starttimes for performance counters
+    perf_stats = {},            -- performance counters
+    sorted_perf_stats = {},     -- sorted performance counters for UI
+}
+
+local function perf_start(id)
+
+    local s = system_state
+    s.perf_stat_start[id] = SysTime()
+    s.perf_stats[id] = s.perf_stats[id] or 0
+
+end
+
+local function perf_end(id)
+
+    local s = system_state
+    if s.perf_stat_start[id] then
+        s.perf_stats[id] = s.perf_stats[id] + SysTime() - s.perf_stat_start[id]
+        s.perf_stat_count[id] = (s.perf_stat_count[id] or 0) + 1
+    end
+
+end
 
 local command_functors = {
     [CMD_RESET] = function(cmd)
@@ -136,29 +232,11 @@ local command_functors = {
     [CMD_PAINTVGUI] = function(cmd)
         local panel = cmd.panel
         if IsValid(panel) then
+            perf_start("PANEL:PaintManual")
             panel:PaintManual()
+            perf_end("PANEL:PaintManual")
         end
     end,
-}
-
-local system_state = {
-    eye_pos = vec_new(),        -- camera position
-    eye_dir = vec_new(),        -- camera forward direction
-    pressed = {false,false},    -- inputs being pressed this frame
-    released = {false, false},  -- inputs being released this frame
-    prev_down = {false, false}, -- inputs previous held down
-    down = {false, false},      -- inputs being held down this frame
-    pass = 1,                   -- current pass being computed
-    screen_index = 1,           -- current index being processed
-    screen_state = nil,         -- the current screen being processed
-    screen_interact = nil,      -- the current screen being interacted with
-    screen_interact_prev = nil, -- the previous screen being interacted with
-    num_processed = 0,          -- number of screens processed
-    num_rendered = 0,           -- number of screens rendered (all passes)
-    num_commands = 0,           -- number of queued commands
-    command_list = {},          -- command list
-    hovered_panel,              -- the currently hovered vgui panel
-    captured_panels = {},       -- panels requesting input capture
 }
 
 local trace_result_table = {}
@@ -574,33 +652,6 @@ local function run_pass(pass)
 
 end
 
-hook.Add("HUDPaint", "hi", function()
-
-    draw.SimpleText(
-        "Screens Processed: " .. system_state.num_processed,
-        "DermaLarge",
-        500, 0)
-
-    draw.SimpleText(
-        "Screens Rendered: " .. system_state.num_rendered,
-        "DermaLarge",
-        500, 30)
-
-    draw.SimpleText(
-        "Render Commands Queued: " .. system_state.num_commands,
-        "DermaLarge",
-        500, 60)
-
-end)
-
-hook.Add("PreDrawEffects", "hi", function() end)
-hook.Add("PreRender", "hi", function()
-    system_state.num_processed = 0
-    system_state.num_rendered = 0
-    system_state.first_view = true
-    --print("BEGIN RENDER:")
-end)
-
 local function get_active_screen_and_panel()
 
     local screen = system_state.screen_interact
@@ -681,6 +732,7 @@ end
 local function gui_mouse_pos()
 
     local screen, panel = get_active_screen_and_panel()
+    if not screen then return 0,0 end
     return screen.cursor[1], screen.cursor[2]
 
 end
@@ -810,6 +862,62 @@ local function vgui_enable_detours(enable)
 
 end
 
+local function get_cached_rendertarget(index)
+
+    local rt_size = RENDERTARGET_SIZE
+    local rt_list = system_state.render_targets
+    if not rt_list[index] then
+        local rt_prefix = "screenatlas_rt_"
+        local rt_name = rt_prefix .. (index-1)
+        local rt_params = {
+            rt_size, 
+            rt_size, 
+            RT_SIZE_LITERAL, 
+            MATERIAL_RT_DEPTH_NONE, 
+            0, 
+            CREATERENDERTARGETFLAGS_UNFILTERABLE_OK, 
+            IMAGE_FORMAT_ABGR8888
+        }
+        rt_list[index] = GetRenderTargetEx(rt_name, unpack(rt_params))
+    end
+    return rt_list[index], rt_size
+
+end
+
+local function allocate_screen_rendertargets()
+
+    local rt_num = 1
+    local rt, rt_size = get_cached_rendertarget(rt_num)
+
+    local packer = atlas_packer(rt_size, rt_size, 1)
+    for i=1, system_state.screen_index-1 do
+
+        local state = screen_states[i]
+        state.render_target = nil
+        state.render_rect = nil
+
+        if not state.valid then continue end
+        if state.behind then continue end
+
+        local node = packer(state.xres, state.yres)
+        if not node then
+            local new_packer = atlas_packer(rt_size, rt_size, 1)
+            node = new_packer(state.xres, state.yres)
+            if not node then continue end
+            packer = new_packer
+            rt_num = rt_num + 1
+            rt, rt_size = get_cached_rendertarget(rt_num)
+        end
+
+        state.render_target = rt
+        state.render_rect = node
+
+    end
+
+    system_state.num_render_targets = rt_num
+
+end
+
 local function process_screens(view)
 
     local eye_pos = view.origin 
@@ -832,8 +940,27 @@ local function process_screens(view)
     vec_set(system_state.eye_pos, eye_pos:Unpack())
     vec_set(system_state.eye_dir, eye_dir:Unpack())
 
+    perf_start("pass_compute")
     run_pass(PASS_COMPUTE)
+    perf_end("pass_compute")
 
+    perf_start("transform_screens")
+    for i=1, system_state.screen_index-1 do
+
+        local state = screen_states[i]
+        vec_set(state.vertices[1], 0, 0, 0)
+        vec_set(state.vertices[2], state.xres, 0, 0)
+        vec_set(state.vertices[3], state.xres, state.yres, 0)
+        vec_set(state.vertices[4], 0, state.yres, 0)
+
+        for j=1, 4 do
+            mtx_vmul(state.to_world, state.vertices[j], 1, state.w_vertices[j])
+        end
+
+    end
+    perf_end("transform_screens")
+
+    perf_start("trace_screens")
     -- find the screen we're most likely interacting with
     local closest_screen = nil
     local closest_dist = math.huge
@@ -862,6 +989,7 @@ local function process_screens(view)
         local tr = util.TraceLine(trace_table)
         if tr.Fraction ~= 1.0 then closest_screen = nil end
     end
+    perf_end("trace_screens")
 
     system_state.screen_interact_prev = system_state.screen_interact
     system_state.screen_interact = closest_screen
@@ -877,15 +1005,18 @@ local function process_screens(view)
     if system_state.screen_interact_prev 
     and IsValid(system_state.prev_active_panel) then
 
+        perf_start("vgui_update_hovered")
         update_hovered_panels(
             system_state.screen_interact_prev, 
             system_state.prev_active_panel, 
             false)
+        perf_end("vgui_update_hovered")
 
     end
 
     if active_panel then
 
+        perf_start("vgui_input")
         active_panel:SetMouseInputEnabled(true)
         active_panel:InvalidateLayout(true)
 
@@ -900,6 +1031,7 @@ local function process_screens(view)
         if not b then print(e) end
 
         active_panel:InvalidateLayout(true)
+        perf_end("vgui_input")
 
     elseif IsValid(system_state.prev_active_panel) then
 
@@ -907,7 +1039,9 @@ local function process_screens(view)
 
     end
 
+    perf_start("pass_execute")
     run_pass(PASS_EXECUTE)
+    perf_end("pass_execute")
 
     if active_panel then
 
@@ -917,9 +1051,147 @@ local function process_screens(view)
 
     end
 
+    if USE_RENDERTARGETS then
+
+        perf_start("rt_allocate")
+        allocate_screen_rendertargets()
+        perf_end("rt_allocate")
+
+    end
+
+end
+
+local rt_material = CreateMaterial(
+    "screenatlasrt_material3", 
+    "UnlitGeneric", 
+    {
+        ["$translucent"] = 1,
+        ["$vertexcolor"] = 0,
+    })
+
+local mesh_begin = mesh.Begin
+local mesh_pos = mesh.Position
+local mesh_texcoord = mesh.TexCoord
+local mesh_end = mesh.End
+local mesh_advance = mesh.AdvanceVertex
+
+local function draw_screen_textured_quad(state)
+
+    local rt, rect = state.render_target, state.render_rect
+    if not rt or not rect then return end
+
+    local rt_size = RENDERTARGET_SIZE
+    local x,y,w,h = rect.x, rect.y, rect.w, rect.h
+
+    mesh_begin(MATERIAL_QUADS, 1)
+    mesh_pos(unpack(state.w_vertices[1]))
+    mesh_texcoord(0, x / rt_size, y / rt_size)
+    mesh_advance()
+
+    mesh_pos(unpack(state.w_vertices[2]))
+    mesh_texcoord(0, (x + w) / rt_size, y / rt_size)
+    mesh_advance()
+
+    mesh_pos(unpack(state.w_vertices[3]))
+    mesh_texcoord(0, (x + w) / rt_size, (y + h) / rt_size)
+    mesh_advance()
+
+    mesh_pos(unpack(state.w_vertices[4]))
+    mesh_texcoord(0, (x) / rt_size, (y + h) / rt_size)
+    mesh_advance()
+    mesh_end()
+
+end
+
+local clear_color = Color(0,0,0,0)
+local function draw_screens_to_rendertargets()
+
+    perf_start("rt_render")
+
+    -- clear all in-use rendertargets
+    for i=1, system_state.num_render_targets do
+        local rt = system_state.render_targets[i]
+        render.ClearRenderTarget(rt, clear_color)
+    end
+
+    -- draw each screen to its designated location 
+    -- within its rendertarget
+    local main_rt = render.GetRenderTarget()
+    local scr_w, scr_h = ScrW(), ScrH()
+    local current_rt = main_rt
+    for i=1, system_state.screen_index-1 do
+
+        local state = screen_states[i]
+        local rt, rect = state.render_target, state.render_rect
+        if not rt then continue end
+
+        -- update current rendertarget
+        if rt ~= current_rt then
+            current_rt = rt
+            render.SetRenderTarget(current_rt)
+        end
+
+        -- work within allocated rectangle inside rendertarget
+        -- for this screen
+        render.SetViewPort(rect.x, rect.y, rect.w, rect.h)
+        cam.Start2D()
+
+        local old = DisableClipping( false )
+
+        -- process drawing commands
+        for j=state.first_command, state.last_command do
+            process_command(system_state.command_list[j])
+        end
+
+        DisableClipping(old)
+
+        cam.End2D()
+
+        system_state.num_rendered = system_state.num_rendered + 1
+
+    end
+
+    render.SetRenderTarget(main_rt)
+    render.SetViewPort(0, 0, scr_w, scr_h)
+
+    perf_end("rt_render")
+
 end
 
 local function render_screens()
+
+    if USE_RENDERTARGETS then
+
+        perf_start("screen_render")
+
+        render.SetMaterial(rt_material)
+        local last_rt_texture = nil
+
+        -- draw textured quads for each screen's sub-rectangle
+        for i=1, system_state.screen_index-1 do
+
+            local rt_size = RENDERTARGET_SIZE
+            local state = screen_states[i]
+            local rt, rect = state.render_target, state.render_rect
+            if not rt then continue end
+
+            local x,y,w,h = rect.x, rect.y, rect.w, rect.h
+            if rt ~= last_rt_texture then
+                last_rt_texture = rt
+                rt_material:SetTexture("$basetexture", rt)
+            end
+
+            perf_start("screen_render_quad")
+            draw_screen_textured_quad(state)
+            perf_end("screen_render_quad")
+
+        end
+
+        perf_end("screen_render")
+
+        return
+
+    end
 
     render.SetStencilEnable(true)
     render.SetStencilReferenceValue( 1 )
@@ -971,22 +1243,89 @@ local function render_screens()
 
 end
 
+hook.Add("PreRender", "hi", function()
+
+    system_state.sorted_perf_stats = {}
+    system_state.perf_stats["rt_render"] = 
+    (system_state.perf_stats["rt_render"] or 0) - 
+    (system_state.perf_stats["PANEL:PaintManual"] or 0)
+
+    for k,v in pairs(system_state.perf_stats) do
+        local count = system_state.perf_stat_count[k]
+        table.insert(system_state.sorted_perf_stats, {
+            name = k, 
+            time = v, 
+            count = count or 0
+        })
+    end
+
+    table.sort(system_state.sorted_perf_stats, function(a,b)
+        return a.name < b.name
+    end)
+
+    system_state.num_processed = 0
+    system_state.num_rendered = 0
+    system_state.num_render_passes = 0
+    system_state.first_view = true
+    system_state.perf_stats = {}
+    system_state.perf_stat_count = {}
+    --print("BEGIN RENDER:")
+
+    local view = render.GetViewSetup()
+    process_screens(view)
+
+    if USE_RENDERTARGETS then draw_screens_to_rendertargets() end
+
+end)
+
 hook.Add("PostDrawOpaqueRenderables", "hi", function()
 
     local view = render.GetViewSetup()
     if view.viewid == VIEW_3DSKY then return end
     --if view.viewid ~= 0 then return end
 
-    if system_state.first_view then
+    system_state.num_render_passes = system_state.num_render_passes + 1
 
-        system_state.first_view = false
-        process_screens(view)
-
-    end
+    --if system_state.first_view then process_screens(view) end
 
     vgui_enable_detours(true)
-    render_screens()
+    local b,e = pcall(render_screens, system_state.first_view)
+    if not b then print(e) end
     vgui_enable_detours(false)
+
+    system_state.first_view = false
+
+end)
+
+hook.Add("HUDPaint", "hi", function()
+
+    local y = 0
+    local function count(name, num)
+        draw.SimpleText(
+            name .. ": " .. num,
+            "DermaLarge",
+            500, y)
+        y = y + 30
+    end
+
+    count("Screens Processed", system_state.num_processed)
+    count("Screens Rendered", system_state.num_rendered)
+    count("Render Commands Queued", system_state.num_commands)
+    count("Render Targets Used", system_state.num_render_targets)
+    count("Render Passes", system_state.num_render_passes)
+
+    for _,v in ipairs(system_state.sorted_perf_stats) do
+        local t = v.time
+        local tc = math.min(t * 100000, 255)
+        surface.SetDrawColor(tc,255 - tc,0,255)
+        surface.DrawRect(500, y, t * 100000, 15)
+        draw.SimpleText(("%s: %0.2fms [%i]"):format(
+            v.name, 
+            t * 1000, 
+            v.count), 
+        "DermaDefault", 500, y)
+        y = y + 15
+    end
 
 end)
 
@@ -1004,25 +1343,25 @@ hook.Add("PlayerBindPress", "hi", function(ply, bind, pressed, code)
 
 end)
 
-local btn_sounds = {1,2,3,4,5,6,8,9,10,14,15,16,17,18,19,24}
+local btn_sounds = {1,2,3,4,5,6,8,9}--6,8,9,10,14,15,16,17,18,19,24}
 
 local function create_test_panel(entity)
 
     local panel = vgui.Create("DPanel")
-    panel.xres, panel.yres = 400, 300
+    panel.xres, panel.yres = 800, 600
     panel:SetBackgroundColor(Color(20,20,20))
     panel:SetSize(200,200)
     panel.entity = entity
     
     local res = vgui.Create("DPanel", panel)
-    res:SetWide(120)
-    res:Dock(LEFT)
+    res:SetTall(50)
+    res:Dock(TOP)
 
     local function make_res(w,h)
         local res = vgui.Create("DButton", res)
         res:SetFont("DermaLarge")
         res:DockMargin(4,4,4,4)
-        res:Dock(TOP)
+        res:Dock(LEFT)
         res:SetText(w .. "x" .. h)
         res:SizeToContents()
         res.DoClick = function() panel.xres, panel.yres = w,h end
@@ -1052,29 +1391,17 @@ local function create_test_panel(entity)
 
 end
 
-if IsValid(G_VGUI_TEST) then G_VGUI_TEST:Remove() end
-
-
---[[local btn0 = vgui.Create("DButton", G_VGUI_TEST)
-btn0:Dock(LEFT)
-btn0.DoClick = function() print("CLICK LEFT") end
-local btn1 = vgui.Create("DButton", G_VGUI_TEST)
-btn1:Dock(RIGHT)
-btn1.DoClick = function() print("CLICK RIGHT") end
-local btn2 = vgui.Create("DButton", G_VGUI_TEST)
-btn2:Dock(BOTTOM)
-btn2.DoClick = function() print("CLICK BOTTOM") end]]
-
 local refresh_panels = true
-
 local lmb_material = Material("gui/lmb.png")
+local function remove_entity_panel(ent, pnl)
+    pnl:Remove()
+end
 hook.Add("ProcessScreens", "hi", function(s)
 
     local do_refresh = refresh_panels
     refresh_panels = false
 
     local t = CurTime()
-    local ply = LocalPlayer()
     for _, ent in ents.Iterator() do
         if ent:IsDormant() then continue end
         if ent:GetClass() ~= "prop_physics" then continue end
@@ -1092,7 +1419,7 @@ hook.Add("ProcessScreens", "hi", function(s)
                 if IsValid(pnl) then
                     ent.test_panel = pnl
                     ent:CallOnRemove("RemoveMyPanel", 
-                    pnl.Remove,
+                    remove_entity_panel,
                     pnl)
                 end
             end
@@ -1113,6 +1440,9 @@ hook.Add("ProcessScreens", "hi", function(s)
                 s.set_color(0,0,0,180)
                 s.rect(0,0,w,h)
             end
+
+            s.set_color(0,0,0)
+            s.text("id: " .. ent:EntIndex(), 10, h-30)
 
             s.finish()
 
