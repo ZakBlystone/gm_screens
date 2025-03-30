@@ -40,9 +40,11 @@ local function make_screen_state()
 
     return {
         owning_entity = nil,       -- the entity that owns this (if applicable)
+        active_panel = nil,        -- the active vgui panel on this screen
         position = vec_new(),      -- position of screen in world-space
         rotation = vec_new(),      -- rotation of screen in world-space
-        cursor = vec_new(),        -- last valid cursor coordinates
+        last_cursor = vec_new(),   -- previous valid cursor coordinates
+        cursor = vec_new(),        -- current valid cursor coordinates
         world_cursor = vec_new(),  -- last valid cursor world coordinates
         trace_toi = math.huge,     -- last trace distance to surface
         width = 0,                 -- width of screen
@@ -80,6 +82,7 @@ local CMD_SETMATERIAL = 3
 local CMD_DRAWRECT = 4
 local CMD_DRAWIMAGE = 5
 local CMD_TEXT = 6
+local CMD_PAINTVGUI = 7
 
 local draw_state = {
     color = {255,255,255,255},
@@ -130,6 +133,12 @@ local command_functors = {
         surface.SetTextPos(x, y)
         surface.DrawText(cmd.str)
     end,
+    [CMD_PAINTVGUI] = function(cmd)
+        local panel = cmd.panel
+        if IsValid(panel) then
+            panel:PaintManual()
+        end
+    end,
 }
 
 local system_state = {
@@ -148,6 +157,8 @@ local system_state = {
     num_rendered = 0,           -- number of screens rendered (all passes)
     num_commands = 0,           -- number of queued commands
     command_list = {},          -- command list
+    hovered_panel,              -- the currently hovered vgui panel
+    captured_panels = {},       -- panels requesting input capture
 }
 
 local trace_result_table = {}
@@ -286,6 +297,7 @@ local function scr_start(position, rotation, width, height, owning_entity)
 
     if system_state.pass == PASS_COMPUTE then
 
+        state.active_panel = nil
         state.owning_entity = owning_entity
         state.valid = false
         state.width = width
@@ -492,6 +504,29 @@ local function scr_text_center(str, x, y)
 
 end
 
+local function scr_vgui(panel)
+
+    local state = system_state.screen_state
+    if not state then return end
+
+    if system_state.pass == PASS_COMPUTE then
+        if IsValid(panel) then
+            panel:SetSize( state.xres, state.yres )
+            panel:SetPaintedManually(true)
+            panel:SetMouseInputEnabled(false)
+            state.active_panel = panel
+        else
+            state.active_panel = nil
+        end
+    elseif system_state.pass == PASS_EXECUTE then
+        if IsValid(panel) then
+            local cmd = alloc_command(CMD_PAINTVGUI)
+            cmd.panel = panel
+        end
+    end
+
+end
+
 local function create_nop(...)
     local t = {...}
     return function() return unpack(t) end 
@@ -528,6 +563,7 @@ api_register("rect", scr_rect, PASS_EXECUTE)
 api_register("image", scr_image, PASS_EXECUTE)
 api_register("text", scr_text, PASS_EXECUTE)
 api_register("text_center", scr_text_center, PASS_EXECUTE)
+api_register("vgui", scr_vgui, PASS_COMPUTE + PASS_EXECUTE)
 
 local function run_pass(pass)
 
@@ -565,6 +601,215 @@ hook.Add("PreRender", "hi", function()
     --print("BEGIN RENDER:")
 end)
 
+local function get_active_screen_and_panel()
+
+    local screen = system_state.screen_interact
+    if not screen then return nil end
+    local panel = screen.active_panel
+    if not IsValid(panel) then return screen, nil end
+    return screen, panel
+
+end
+
+local function recursive_send_cursor_move(panel, cx, cy)
+
+    if not panel:IsVisible() or not panel:IsMouseInputEnabled() then return end
+
+    local w, h = panel:GetSize()
+    local x, y = panel:GetPos()
+
+    --if cx < x or cy < y or cx > x + w or cy > y + h then return end
+
+    cx = cx - x
+    cy = cy - y
+
+    if panel.OnCursorMoved then panel:OnCursorMoved( cx, cy ) end
+
+    for i=0, panel:ChildCount()-1 do
+        recursive_send_cursor_move(panel:GetChild(i), cx, cy)
+    end
+
+end
+
+local function recursive_update_hovered_panels(panel, cx, cy, enable)
+
+    if not panel:IsVisible() 
+    or not panel:IsMouseInputEnabled() then 
+
+        enable = false
+
+    end
+
+    local w, h = panel:GetSize()
+    local x, y = panel:GetPos()
+
+    if cx < x or cy < y or cx > x + w or cy > y + h then enable = false end
+
+    panel.Hovered = enable
+
+    cx = cx - x
+    cy = cy - y
+
+    local hovered_panel = nil
+    if enable then hovered_panel = panel end
+    for i=0, panel:ChildCount()-1 do
+        local child = panel:GetChild(i)
+        local hovered = recursive_update_hovered_panels(child, cx, cy, enable)
+        if hovered then hovered_panel = hovered end
+    end
+
+    return hovered_panel
+
+end
+
+local function update_hovered_panels(screen, panel, enable)
+
+    system_state.hovered_panel = recursive_update_hovered_panels(
+        panel, 
+        screen.cursor[1], 
+        screen.cursor[2], 
+        enable)
+
+end
+
+local function vgui_get_hovered_panel()
+
+    return system_state.hovered_panel
+
+end
+
+local function gui_mouse_pos()
+
+    local screen, panel = get_active_screen_and_panel()
+    return screen.cursor[1], screen.cursor[2]
+
+end
+
+local function gui_mouse_x()
+
+    local screen, panel = get_active_screen_and_panel()
+    return screen.cursor[1]
+
+end
+
+local function gui_mouse_y()
+
+    local screen, panel = get_active_screen_and_panel()
+    return screen.cursor[2]
+
+end
+
+local function input_get_cursor()
+
+    local screen, panel = get_active_screen_and_panel()
+    return screen.cursor[1], screen.cursor[2]
+
+end
+
+local function panel_mouse_capture(panel, capture)
+
+    if capture then
+        system_state.captured_panels[panel] = true
+    else
+        system_state.captured_panels[panel] = nil
+    end
+
+end
+
+local function panel_cursor_pos(panel)
+
+    local x,y = gui_mouse_pos()
+    return panel:ScreenToLocal(x,y)
+
+end
+
+local function run_vgui_input()
+
+    local screen, panel = get_active_screen_and_panel()
+    if not IsValid(panel) then return end
+
+    local hovered = vgui.GetHoveredPanel()
+    if hovered ~= screen.last_hovered then
+        if IsValid(screen.last_hovered) 
+        and screen.last_hovered.OnCursorExited then
+            screen.last_hovered:OnCursorExited()
+        end
+        if IsValid(hovered) 
+        and hovered.OnCursorEntered then
+            hovered:OnCursorEntered()
+        end
+        screen.last_hovered = hovered
+    end
+
+    if system_state.pressed[1] then
+        for panel, _ in pairs(system_state.captured_panels) do
+            panel:OnMousePressed(MOUSE_LEFT)
+        end
+        if IsValid(hovered) 
+        and hovered.OnMousePressed then
+            hovered:OnMousePressed(MOUSE_LEFT)
+            screen.last_pressed = hovered
+        end
+    end
+
+    if system_state.released[1] then
+        if IsValid(screen.last_pressed) 
+        and screen.last_pressed.OnMouseReleased then
+            screen.last_pressed:OnMouseReleased(MOUSE_LEFT)
+            screen.last_pressed = nil
+        end
+        for panel, _ in pairs(system_state.captured_panels) do
+            panel:OnMouseReleased(MOUSE_LEFT)
+        end
+    end
+
+    if screen.last_cursor[1] ~= screen.cursor[1]
+    or screen.last_cursor[2] ~= screen.cursor[2] then
+
+        recursive_send_cursor_move(
+            panel, 
+            screen.cursor[1], 
+            screen.cursor[2])
+
+    end
+
+end
+
+local panel_meta = FindMetaTable("Panel")
+local detour_hovered_panel = vgui.GetHoveredPanel
+local detour_mouse_pos = gui.MousePos
+local detour_mouse_x = gui.MouseX
+local detour_mouse_y = gui.MouseY
+local detour_cursor = input.GetCursorPos
+local detour_mouse_capture = panel_meta.MouseCapture
+local detour_cursor_pos = panel_meta.CursorPos
+
+local function vgui_enable_detours(enable)
+
+    if enable then
+
+        vgui.GetHoveredPanel = vgui_get_hovered_panel
+        gui.MousePos = gui_mouse_pos
+        gui.MouseX = gui_mouse_x
+        gui.MouseY = gui_mouse_y
+        input.GetCursorPos = input_get_cursor
+        panel_meta.MouseCapture = panel_mouse_capture
+        panel_meta.CursorPos = panel_cursor_pos
+
+    else
+
+        vgui.GetHoveredPanel = detour_hovered_panel
+        gui.MousePos = detour_mouse_pos
+        gui.MouseX = detour_mouse_x
+        gui.MouseY = detour_mouse_y
+        input.GetCursorPos = detour_cursor
+        panel_meta.MouseCapture = detour_mouse_capture
+        panel_meta.CursorPos = detour_cursor_pos
+
+    end
+
+end
+
 local function process_screens(view)
 
     local eye_pos = view.origin 
@@ -580,13 +825,8 @@ local function process_screens(view)
         local prev_down_state = system_state.prev_down[i]
         local curr_down_state = system_state.down[i]
         system_state.prev_down[i] = system_state.down[i]
-
-        if prev_down_state == false and curr_down_state == true then
-            system_state.pressed[i] = true
-        end
-        if prev_down_state == true and curr_down_state == false then
-            system_state.released[i] = true
-        end
+        system_state.pressed[i] = not prev_down_state and curr_down_state
+        system_state.released[i] = prev_down_state and not curr_down_state
     end
 
     vec_set(system_state.eye_pos, eye_pos:Unpack())
@@ -607,6 +847,7 @@ local function process_screens(view)
 
     -- compute the local trace and world trace
     if closest_screen then
+        vec_set(closest_screen.last_cursor, unpack(closest_screen.cursor))
         compute_screen_trace(closest_screen, closest_screen.cursor)
         mtx_vmul(
             closest_screen.to_world, 
@@ -626,7 +867,55 @@ local function process_screens(view)
     system_state.screen_interact = closest_screen
     system_state.num_commands = 0
 
+    local active_panel = nil
+    if closest_screen and IsValid(closest_screen.active_panel) then
+        active_panel = closest_screen.active_panel
+    end
+    system_state.prev_active_panel = system_state.active_panel
+    system_state.active_panel = active_panel
+
+    if system_state.screen_interact_prev 
+    and IsValid(system_state.prev_active_panel) then
+
+        update_hovered_panels(
+            system_state.screen_interact_prev, 
+            system_state.prev_active_panel, 
+            false)
+
+    end
+
+    if active_panel then
+
+        active_panel:SetMouseInputEnabled(true)
+        active_panel:InvalidateLayout(true)
+
+        update_hovered_panels(
+            system_state.screen_interact, 
+            active_panel, 
+            true)
+
+        vgui_enable_detours(true)
+
+        local b,e = pcall(run_vgui_input)
+        if not b then print(e) end
+
+        active_panel:InvalidateLayout(true)
+
+    elseif IsValid(system_state.prev_active_panel) then
+
+        system_state.captured_panels = {}
+
+    end
+
     run_pass(PASS_EXECUTE)
+
+    if active_panel then
+
+        active_panel:SetMouseInputEnabled(false)
+
+        vgui_enable_detours(false)
+
+    end
 
 end
 
@@ -686,7 +975,7 @@ hook.Add("PostDrawOpaqueRenderables", "hi", function()
 
     local view = render.GetViewSetup()
     if view.viewid == VIEW_3DSKY then return end
-    if view.viewid ~= 0 then return end
+    --if view.viewid ~= 0 then return end
 
     if system_state.first_view then
 
@@ -695,7 +984,9 @@ hook.Add("PostDrawOpaqueRenderables", "hi", function()
 
     end
 
+    vgui_enable_detours(true)
     render_screens()
+    vgui_enable_detours(false)
 
 end)
 
@@ -713,44 +1004,114 @@ hook.Add("PlayerBindPress", "hi", function(ply, bind, pressed, code)
 
 end)
 
+local btn_sounds = {1,2,3,4,5,6,8,9,10,14,15,16,17,18,19,24}
+
+local function create_test_panel(entity)
+
+    local panel = vgui.Create("DPanel")
+    panel.xres, panel.yres = 400, 300
+    panel:SetBackgroundColor(Color(20,20,20))
+    panel:SetSize(200,200)
+    panel.entity = entity
+    
+    local res = vgui.Create("DPanel", panel)
+    res:SetWide(120)
+    res:Dock(LEFT)
+
+    local function make_res(w,h)
+        local res = vgui.Create("DButton", res)
+        res:SetFont("DermaLarge")
+        res:DockMargin(4,4,4,4)
+        res:Dock(TOP)
+        res:SetText(w .. "x" .. h)
+        res:SizeToContents()
+        res.DoClick = function() panel.xres, panel.yres = w,h end
+    end
+
+    make_res(800,600)
+    make_res(400,300)
+    make_res(600,300)
+
+    local scroll = vgui.Create("DScrollPanel", panel)
+    scroll:Dock(FILL)
+    scroll.VBar:SetWide(32)
+    
+    for i=1, #btn_sounds do
+        local btn = vgui.Create("DButton")
+        btn:SetText("button" .. btn_sounds[i] .. ".wav")
+        btn:SetFont("DermaLarge")
+        btn.DoClick = function()
+            panel.entity:EmitSound("buttons/button" .. btn_sounds[i] .. ".wav")
+        end
+        btn:SetTall(48)
+        scroll:AddItem(btn)
+        btn:Dock(TOP)
+    end
+
+    return panel
+
+end
+
+if IsValid(G_VGUI_TEST) then G_VGUI_TEST:Remove() end
+
+
+--[[local btn0 = vgui.Create("DButton", G_VGUI_TEST)
+btn0:Dock(LEFT)
+btn0.DoClick = function() print("CLICK LEFT") end
+local btn1 = vgui.Create("DButton", G_VGUI_TEST)
+btn1:Dock(RIGHT)
+btn1.DoClick = function() print("CLICK RIGHT") end
+local btn2 = vgui.Create("DButton", G_VGUI_TEST)
+btn2:Dock(BOTTOM)
+btn2.DoClick = function() print("CLICK BOTTOM") end]]
+
+local refresh_panels = true
+
 local lmb_material = Material("gui/lmb.png")
 hook.Add("ProcessScreens", "hi", function(s)
+
+    local do_refresh = refresh_panels
+    refresh_panels = false
 
     local t = CurTime()
     local ply = LocalPlayer()
     for _, ent in ents.Iterator() do
         if ent:IsDormant() then continue end
         if ent:GetClass() ~= "prop_physics" then continue end
-        if ent:GetModel() == "models/props_c17/tv_monitor01.mdl" then
+        if ent:GetModel() == "models/blacknecro/tv_plasma_4_3.mdl" then
 
-            s.start(ent:GetPos(), ent:GetAngles(), 15, 10.5, ent)
-            s.set_res(320,240)
-            s.set_anchor(0.62,0.565,6)
-            local x,y = s.get_cursor()
+            if do_refresh then
+                if IsValid(ent.test_panel) then 
+                    ent.test_panel:Remove()
+                    ent.test_panel = nil
+                end
+            end
+
+            if not ent.test_panel then
+                local pnl = create_test_panel(ent)
+                if IsValid(pnl) then
+                    ent.test_panel = pnl
+                    ent:CallOnRemove("RemoveMyPanel", 
+                    pnl.Remove,
+                    pnl)
+                end
+            end
+
+            s.start(ent:GetPos(), ent:GetAngles(), 56, 43, ent)
+            s.set_res(800/2,600/2)
+            if IsValid(ent.test_panel) then
+                s.set_res(ent.test_panel.xres, ent.test_panel.yres)
+            end
+            s.set_anchor(0.5,0.5,0.5)
+
             local w,h = s.get_res()
-            local interact = s.is_interacting()
-            if s.is_pressed(1) then
-                ent.__toggle = not ent.__toggle
-                ent:EmitSound("buttons/button1.wav")
-            end
-            s.set_color(46,80,120)
-            if ent.__toggle then 
-                s.set_color(165,74,71)
-                if interact then s.set_color(80,20,20) end
-            elseif interact then
-                s.set_color(73,197,129)
-            end
+            s.vgui(ent.test_panel)
+            s.set_color(10,20,60,180)
             s.rect(0,0,w,h)
-            if interact then
-                s.set_color(255,255,255)
-                s.image(x-20,y-20,40,40,lmb_material)
-            end
-            s.set_font("DermaLarge")
-            s.set_color(255,255,255)
-            s.text_center("Toggled: " .. tostring(ent.__toggle or false), w/2, h/2)
 
-            for i=1, 30 do
-                s.rect(i*10, 20 + math.sin(t*4+i) * 10, 8, 8)
+            if not s.is_interacting() then
+                s.set_color(0,0,0,180)
+                s.rect(0,0,w,h)
             end
 
             s.finish()
@@ -759,3 +1120,30 @@ hook.Add("ProcessScreens", "hi", function(s)
     end
 
 end)
+
+--[[local x,y = s.get_cursor()
+local w,h = s.get_res()
+local interact = s.is_interacting()
+if s.is_pressed(1) then
+    ent.__toggle = not ent.__toggle
+    ent:EmitSound("buttons/button1.wav")
+end
+s.set_color(46,80,120)
+if ent.__toggle then 
+    s.set_color(165,74,71)
+    if interact then s.set_color(80,20,20) end
+elseif interact then
+    s.set_color(73,197,129)
+end
+s.rect(0,0,w,h)
+if interact then
+    s.set_color(255,255,255)
+    s.image(x-20,y-20,40,40,lmb_material)
+end
+s.set_font("DermaLarge")
+s.set_color(255,255,255)
+s.text_center("Toggled: " .. tostring(ent.__toggle or false), w/2, h/2)
+
+for i=1, 30 do
+    s.rect(i*10, 20 + math.sin(t*4+i) * 10, 8, 8)
+end]]
