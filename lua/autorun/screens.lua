@@ -18,6 +18,12 @@ local function vec_ma(v, a, s, o)
 
 end
 
+local function vec_dist_sqr(a, b)
+
+    return (a[1] - b[1]) ^ 2 + (a[2] - b[2]) ^ 2 + (a[3] - b[3]) ^ 2
+
+end
+
 local function mtx_new() return {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1} end
 local function mtx_set(m, ...)
 
@@ -75,6 +81,7 @@ end
 local function make_screen_state()
 
     return {
+        pixel_vis = util.GetPixelVisibleHandle(),
         owning_entity = nil,       -- the entity that owns this (if applicable)
         active_panel = nil,        -- the active vgui panel on this screen
         position = vec_new(),      -- position of screen in world-space
@@ -95,13 +102,15 @@ local function make_screen_state()
         behind = false,            -- camera is behind screen
         first_command = 0,         -- first command to process for rendering
         last_command = 0,          -- last command to process for rendering
-        vertices = {
+        center = vec_new(),        -- center of screen bounding sphere
+        radius = 0,                -- radius of screen bounding sphere
+        vertices = {               -- screen-space vertices
             vec_new(),
             vec_new(),
             vec_new(),
             vec_new(),
         },
-        w_vertices = {
+        w_vertices = {             -- world-space vertices
             vec_new(),
             vec_new(),
             vec_new(),
@@ -115,7 +124,6 @@ local command_list = {}
 local screen_states = {}
 for i=1, 4096 do screen_states[i] = make_screen_state() end
 
-local USE_RENDERTARGETS = true
 local RENDERTARGET_SIZE = 2048
 
 local PASS_COMPUTE = 1
@@ -164,7 +172,9 @@ local system_state = {
     num_render_targets = 0,     -- number of rendertargets
     perf_stat_count = {},       -- number of samples for performance counters
     perf_stat_start = {},       -- starttimes for performance counters
+    perf_stat_depth = {},       -- depth of each stat
     perf_stats = {},            -- performance counters
+    perf_depth = 1,             -- performance counter depth
     sorted_perf_stats = {},     -- sorted performance counters for UI
 }
 
@@ -173,12 +183,15 @@ local function perf_start(id)
     local s = system_state
     s.perf_stat_start[id] = SysTime()
     s.perf_stats[id] = s.perf_stats[id] or 0
+    s.perf_stat_depth[id] = s.perf_depth
+    s.perf_depth = s.perf_depth + 1
 
 end
 
 local function perf_end(id)
 
     local s = system_state
+    s.perf_depth = s.perf_depth - 1
     if s.perf_stat_start[id] then
         s.perf_stats[id] = s.perf_stats[id] + SysTime() - s.perf_stat_start[id]
         s.perf_stat_count[id] = (s.perf_stat_count[id] or 0) + 1
@@ -188,15 +201,19 @@ end
 
 local command_functors = {
     [CMD_RESET] = function(cmd)
+        perf_start("command_reset")
         for i=1, 4 do draw_state.color[i] = 255 end
         draw_state.font = "DermaDefault"
         draw_state.material = nil
+        perf_end("command_reset")
     end,
     [CMD_SETCOLOR] = function(cmd)
+        perf_start("command_set_color")
         draw_state.color[1] = cmd.r
         draw_state.color[2] = cmd.g
         draw_state.color[3] = cmd.b
         draw_state.color[4] = cmd.a
+        perf_end("command_set_color")
     end,
     [CMD_SETFONT] = function(cmd)
         draw_state.font = cmd.font
@@ -205,8 +222,10 @@ local command_functors = {
         draw_state.material = cmd.material
     end,
     [CMD_DRAWRECT] = function(cmd)
+        perf_start("command_rect")
         surface.SetDrawColor(unpack(draw_state.color))
         surface.DrawRect(cmd.x, cmd.y, cmd.w, cmd.h)
+        perf_end("command_rect")
     end,
     [CMD_DRAWIMAGE] = function(cmd)
         surface.SetDrawColor(unpack(draw_state.color))
@@ -218,6 +237,7 @@ local command_functors = {
         end
     end,
     [CMD_TEXT] = function(cmd)
+        perf_start("command_text")
         surface.SetFont(draw_state.font)
         surface.SetTextColor(unpack(draw_state.color))
         local w,h = surface.GetTextSize(cmd.str)
@@ -228,6 +248,7 @@ local command_functors = {
         elseif cmd.yalign == TEXT_ALIGN_BOTTOM then y = y - h end
         surface.SetTextPos(x, y)
         surface.DrawText(cmd.str)
+        perf_end("command_text")
     end,
     [CMD_PAINTVGUI] = function(cmd)
         local panel = cmd.panel
@@ -354,6 +375,8 @@ end
 
 local function process_command(cmd)
 
+    perf_start("command_time")
+
     local functor = command_functors[cmd.cmd]
     if functor then
         local b,e = pcall(functor, cmd)
@@ -361,6 +384,8 @@ local function process_command(cmd)
     else
         ErrorNoHalt("NO FUNCTOR FOR COMMAND: " .. tostring(cmd.cmd))
     end
+
+    perf_end("command_time")
 
 end
 
@@ -388,11 +413,14 @@ local function scr_start(position, rotation, width, height, owning_entity)
         state.behind = false
         vec_set(state.position, position:Unpack())
         vec_set(state.rotation, rotation:Unpack())
+        return true
 
     elseif system_state.pass == PASS_EXECUTE then
 
+        if not state.should_render then return false end
         alloc_command(CMD_RESET)
         state.first_command = system_state.num_commands
+        return true
 
     end
 
@@ -896,8 +924,7 @@ local function allocate_screen_rendertargets()
         state.render_target = nil
         state.render_rect = nil
 
-        if not state.valid then continue end
-        if state.behind then continue end
+        if not state.should_render then continue end
 
         local node = packer(state.xres, state.yres)
         if not node then
@@ -948,6 +975,7 @@ local function process_screens(view)
     for i=1, system_state.screen_index-1 do
 
         local state = screen_states[i]
+        vec_set(state.center, 0, 0, 0)
         vec_set(state.vertices[1], 0, 0, 0)
         vec_set(state.vertices[2], state.xres, 0, 0)
         vec_set(state.vertices[3], state.xres, state.yres, 0)
@@ -955,7 +983,23 @@ local function process_screens(view)
 
         for j=1, 4 do
             mtx_vmul(state.to_world, state.vertices[j], 1, state.w_vertices[j])
+            vec_ma(state.center, state.w_vertices[j], 1/4, state.center)
         end
+
+        local radius = 0
+        local center = state.center
+        for j=1, 4 do
+            radius = math.max(radius, vec_dist_sqr(center, state.w_vertices[j]))
+        end
+        state.radius = math.sqrt(radius)
+        local vis = util.PixelVisible(
+            Vector(unpack(center)),
+            state.radius * 2,
+            state.pixel_vis
+        )
+
+        state.visible = vis > 0
+        state.should_render = state.visible and (not state.behind)
 
     end
     perf_end("transform_screens")
@@ -982,7 +1026,6 @@ local function process_screens(view)
             closest_screen.world_cursor)
 
         trace_table.start = eye_pos
-        trace_table.mask = 1
         trace_table.endpos:SetUnpacked(unpack(closest_screen.world_cursor))
         trace_table.filter[1] = LocalPlayer()
         trace_table.filter[2] = closest_screen.owning_entity
@@ -1051,13 +1094,9 @@ local function process_screens(view)
 
     end
 
-    if USE_RENDERTARGETS then
-
-        perf_start("rt_allocate")
-        allocate_screen_rendertargets()
-        perf_end("rt_allocate")
-
-    end
+    perf_start("rt_allocate")
+    allocate_screen_rendertargets()
+    perf_end("rt_allocate")
 
 end
 
@@ -1160,101 +1199,45 @@ end
 
 local function render_screens()
 
-    if USE_RENDERTARGETS then
+    perf_start("screen_render")
 
-        perf_start("screen_render")
+    render.SetMaterial(rt_material)
+    local last_rt_texture = nil
 
-        render.SetMaterial(rt_material)
-        local last_rt_texture = nil
-
-        -- draw textured quads for each screen's sub-rectangle
-        for i=1, system_state.screen_index-1 do
-
-            local rt_size = RENDERTARGET_SIZE
-            local state = screen_states[i]
-            local rt, rect = state.render_target, state.render_rect
-            if not rt then continue end
-
-            local x,y,w,h = rect.x, rect.y, rect.w, rect.h
-            if rt ~= last_rt_texture then
-                last_rt_texture = rt
-                rt_material:SetTexture("$basetexture", rt)
-            end
-
-            perf_start("screen_render_quad")
-            draw_screen_textured_quad(state)
-            perf_end("screen_render_quad")
-
-        end
-
-        perf_end("screen_render")
-
-        return
-
-    end
-
-    render.SetStencilEnable(true)
-    render.SetStencilReferenceValue( 1 )
-    render.SetStencilWriteMask( 1 )
-    render.SetStencilTestMask( 1 )
-    render.SetStencilPassOperation( STENCILOPERATION_REPLACE )
-    render.SetStencilFailOperation( STENCILOPERATION_KEEP )
-    render.SetStencilZFailOperation( STENCILOPERATION_KEEP )
-
-    render.PushFilterMag( TEXFILTER.ANISOTROPIC )
-    render.PushFilterMin( TEXFILTER.ANISOTROPIC )
-
+    -- draw textured quads for each screen's sub-rectangle
     for i=1, system_state.screen_index-1 do
 
+        local rt_size = RENDERTARGET_SIZE
         local state = screen_states[i]
-        if not state.valid then continue end
-        if state.behind then continue end
+        local rt, rect = state.render_target, state.render_rect
+        if not rt then continue end
 
-        render_mtx:SetUnpacked( unpack(state.to_world) )
-        cam.PushModelMatrix(render_mtx, true)
-
-        render.ClearStencil()
-        render.SetStencilCompareFunction( STENCILCOMPARISONFUNCTION_ALWAYS )
-        render.OverrideDepthEnable( true, true )
-        render.OverrideColorWriteEnable( true, false )
-        render.SetColorMaterial()
-        surface.SetDrawColor(0, 0, 0, 1)
-        surface.DrawRect(0, 0, state.xres, state.yres )
-        render.OverrideColorWriteEnable( false, false )
-        render.OverrideDepthEnable( false, false )
-        render.SetStencilCompareFunction( STENCILCOMPARISONFUNCTION_EQUAL )
-        cam.IgnoreZ(true)
-
-        for j=state.first_command, state.last_command do
-            process_command(system_state.command_list[j])
+        local x,y,w,h = rect.x, rect.y, rect.w, rect.h
+        if rt ~= last_rt_texture then
+            last_rt_texture = rt
+            rt_material:SetTexture("$basetexture", rt)
         end
 
-        system_state.num_rendered = system_state.num_rendered + 1
-
-        cam.IgnoreZ(false)
-        cam.PopModelMatrix()
+        perf_start("screen_render_quad")
+        draw_screen_textured_quad(state)
+        perf_end("screen_render_quad")
 
     end
 
-    render.PopFilterMag()
-    render.PopFilterMin()
-
-    render.SetStencilEnable(false)
+    perf_end("screen_render")
 
 end
 
 hook.Add("PreRender", "hi", function()
 
     system_state.sorted_perf_stats = {}
-    system_state.perf_stats["rt_render"] = 
-    (system_state.perf_stats["rt_render"] or 0) - 
-    (system_state.perf_stats["PANEL:PaintManual"] or 0)
 
     for k,v in pairs(system_state.perf_stats) do
         local count = system_state.perf_stat_count[k]
+        local depth = system_state.perf_stat_depth[k] or 0
         table.insert(system_state.sorted_perf_stats, {
-            name = k, 
-            time = v, 
+            name = string.rep("-",depth) .. k, 
+            time = v,
             count = count or 0
         })
     end
@@ -1271,10 +1254,13 @@ hook.Add("PreRender", "hi", function()
     system_state.perf_stat_count = {}
     --print("BEGIN RENDER:")
 
+    perf_start("main")
+
     local view = render.GetViewSetup()
     process_screens(view)
+    draw_screens_to_rendertargets()
 
-    if USE_RENDERTARGETS then draw_screens_to_rendertargets() end
+    perf_end("main")
 
 end)
 
@@ -1288,12 +1274,22 @@ hook.Add("PostDrawOpaqueRenderables", "hi", function()
 
     --if system_state.first_view then process_screens(view) end
 
+    perf_start("main")
+
     vgui_enable_detours(true)
     local b,e = pcall(render_screens, system_state.first_view)
     if not b then print(e) end
     vgui_enable_detours(false)
 
     system_state.first_view = false
+
+    perf_end("main")
+
+end)
+
+hook.Add("PostRender", "hi", function()
+
+    
 
 end)
 
@@ -1391,6 +1387,7 @@ local function create_test_panel(entity)
 
 end
 
+local test_vgui = false
 local refresh_panels = true
 local lmb_material = Material("gui/lmb.png")
 local function remove_entity_panel(ent, pnl)
@@ -1414,7 +1411,7 @@ hook.Add("ProcessScreens", "hi", function(s)
                 end
             end
 
-            if not ent.test_panel then
+            if not ent.test_panel and test_vgui then
                 local pnl = create_test_panel(ent)
                 if IsValid(pnl) then
                     ent.test_panel = pnl
@@ -1424,25 +1421,37 @@ hook.Add("ProcessScreens", "hi", function(s)
                 end
             end
 
-            s.start(ent:GetPos(), ent:GetAngles(), 56, 43, ent)
-            s.set_res(800/2,600/2)
-            if IsValid(ent.test_panel) then
-                s.set_res(ent.test_panel.xres, ent.test_panel.yres)
-            end
-            s.set_anchor(0.5,0.5,0.5)
+            if s.start(ent:GetPos(), ent:GetAngles(), 56, 43, ent) then
+                s.set_res(800/2,600/2)
+                if IsValid(ent.test_panel) then
+                    s.set_res(ent.test_panel.xres, ent.test_panel.yres)
+                end
+                s.set_anchor(0.5,0.5,0.5)
 
-            local w,h = s.get_res()
-            s.vgui(ent.test_panel)
-            s.set_color(10,20,60,180)
-            s.rect(0,0,w,h)
-
-            if not s.is_interacting() then
-                s.set_color(0,0,0,180)
+                local w,h = s.get_res()
+                if test_vgui then 
+                    s.vgui(ent.test_panel)
+                end
+                s.set_color(10,20,60,180)
                 s.rect(0,0,w,h)
-            end
 
-            s.set_color(0,0,0)
-            s.text("id: " .. ent:EntIndex(), 10, h-30)
+                if not s.is_interacting() then
+                    local r = 255 * (math.cos(t + ent:EntIndex()) + 1)/2
+                    s.set_color(r,0,0,180)
+                    s.rect(0,0,w,h)
+                end
+
+                if test_vgui then 
+                    s.set_color(0,0,0)
+                else
+                    s.set_color(255,255,255)
+                end
+                s.text("id: " .. ent:EntIndex(), 10, h-30)
+                if not test_vgui then
+                    s.set_font("DermaLarge")
+                    s.text_center("HELLO", w/2, h/2)
+                end
+            end
 
             s.finish()
 
