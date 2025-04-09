@@ -1,3 +1,4 @@
+--if true then return end
 
 if SERVER then
     AddCSLuaFile()
@@ -82,6 +83,8 @@ local function make_screen_state()
 
     return {
         pixel_vis = util.GetPixelVisibleHandle(),
+        rt_id = nil,               -- allocated rendertarget id
+        rt_rect = nil,             -- allocated rendertarget rectangle
         owning_entity = nil,       -- the entity that owns this (if applicable)
         active_panel = nil,        -- the active vgui panel on this screen
         position = vec_new(),      -- position of screen in world-space
@@ -90,6 +93,8 @@ local function make_screen_state()
         cursor = vec_new(),        -- current valid cursor coordinates
         world_cursor = vec_new(),  -- last valid cursor world coordinates
         trace_toi = math.huge,     -- last trace distance to surface
+        capture_mouse = false,     -- should this screen capture mouse inputs
+        capture_use = false,       -- should this screen capture +use bind
         width = 0,                 -- width of screen
         height = 0,                -- height of screen
         xres = 0,                  -- horizontal screen resolution
@@ -390,9 +395,12 @@ local function process_command(cmd)
 end
 
 local render_mtx = Matrix()
+local fmt_unfinished_screen = "WARNING: Unfinished screen, check your code"
 local function scr_start(position, rotation, width, height, owning_entity)
 
     local unfinished = system_state.screen_state ~= nil
+    if unfinished then print(fmt_unfinished_screen) end
+
     local idx = system_state.screen_index
     local state = screen_states[idx]
 
@@ -400,8 +408,10 @@ local function scr_start(position, rotation, width, height, owning_entity)
 
     if system_state.pass == PASS_COMPUTE then
 
+        state.capture_mouse = false
+        state.capture_use = false
         state.active_panel = nil
-        state.owning_entity = owning_entity
+        state.owning_entity = owning_entity or system_state.current_entity
         state.valid = false
         state.width = width
         state.height = height
@@ -495,6 +505,18 @@ local function scr_get_cursor()
 
 end
 
+local function scr_capture_mouse()
+
+    system_state.screen_state.capture_mouse = true
+
+end
+
+local function scr_capture_use()
+
+    system_state.screen_state.capture_use = true
+
+end
+
 local function scr_is_down(i) 
     
     local state = system_state.screen_state
@@ -546,10 +568,10 @@ local function scr_set_color(r, g, b, a)
     if type(r) == "table" then r,g,b,a = r.r, r.g, r.b, r.a end
 
     local cmd = alloc_command(CMD_SETCOLOR, CMF_NOREPEAT)
-    cmd.r = r
-    cmd.g = g
-    cmd.b = b
-    cmd.a = a
+    cmd.r = tonumber(r) or 0
+    cmd.g = tonumber(g) or 0
+    cmd.b = tonumber(b) or 0
+    cmd.a = tonumber(a) or 255
 
 end
 
@@ -570,20 +592,20 @@ end
 local function scr_rect(x, y, w, h)
 
     local cmd = alloc_command(CMD_DRAWRECT)
-    cmd.x = x
-    cmd.y = y
-    cmd.w = w
-    cmd.h = h
+    cmd.x = tonumber(x) or 0
+    cmd.y = tonumber(y) or 0
+    cmd.w = tonumber(w) or 0
+    cmd.h = tonumber(h) or 0
 
 end
 
 local function scr_image(x, y, w, h, material)
 
     local cmd = alloc_command(CMD_DRAWIMAGE)
-    cmd.x = x
-    cmd.y = y
-    cmd.w = w
-    cmd.h = h
+    cmd.x = tonumber(x) or 0
+    cmd.y = tonumber(y) or 0
+    cmd.w = tonumber(w) or 0
+    cmd.h = tonumber(h) or 0
     cmd.material = material
 
 end
@@ -591,9 +613,9 @@ end
 local function scr_text(str, x, y, xalign, yalign)
 
     local cmd = alloc_command(CMD_TEXT)
-    cmd.str = str
-    cmd.x = x or 0
-    cmd.y = y or 0
+    cmd.str = tostring(str)
+    cmd.x = tonumber(x) or 0
+    cmd.y = tonumber(y) or 0
     cmd.xalign = xalign or TEXT_ALIGN_LEFT
     cmd.yalign = yalign or TEXT_ALIGN_TOP
 
@@ -602,9 +624,9 @@ end
 local function scr_text_center(str, x, y)
 
     local cmd = alloc_command(CMD_TEXT)
-    cmd.str = str
-    cmd.x = x or 0
-    cmd.y = y or 0
+    cmd.str = tostring(str)
+    cmd.x = tonumber(x) or 0
+    cmd.y = tonumber(y) or 0
     cmd.xalign = TEXT_ALIGN_CENTER
     cmd.yalign = TEXT_ALIGN_CENTER
 
@@ -656,6 +678,8 @@ api_register("set_anchor", scr_set_anchor, PASS_COMPUTE)
 api_register("set_res", scr_set_res, PASS_COMPUTE)
 api_register("get_res", scr_get_res, PASS_ALL)
 api_register("get_cursor", scr_get_cursor, PASS_EXECUTE, 0, 0)
+api_register("capture_mouse", scr_capture_mouse, PASS_COMPUTE)
+api_register("capture_use", scr_capture_use, PASS_COMPUTE)
 api_register("is_interacting", scr_is_interacting, PASS_EXECUTE, false)
 api_register("is_down", scr_is_down, PASS_EXECUTE, false)
 api_register("is_pressed", scr_is_pressed, PASS_EXECUTE, false)
@@ -914,6 +938,9 @@ end
 
 local function allocate_screen_rendertargets()
 
+    if system_state.screen_index == 1 then return end
+    perf_start("rt_allocate")
+
     local rt_num = 1
     local rt, rt_size = get_cached_rendertarget(rt_num)
 
@@ -921,8 +948,8 @@ local function allocate_screen_rendertargets()
     for i=1, system_state.screen_index-1 do
 
         local state = screen_states[i]
-        state.render_target = nil
-        state.render_rect = nil
+        state.rt_id = nil
+        state.rt_rect = nil
 
         if not state.should_render then continue end
 
@@ -936,14 +963,17 @@ local function allocate_screen_rendertargets()
             rt, rt_size = get_cached_rendertarget(rt_num)
         end
 
-        state.render_target = rt
-        state.render_rect = node
+        state.rt_id = rt_num
+        state.rt_rect = node
 
     end
 
     system_state.num_render_targets = rt_num
+    perf_end("rt_allocate")
 
 end
+
+local center_vec = Vector()
 
 local function process_screens(view)
 
@@ -983,22 +1013,38 @@ local function process_screens(view)
 
         for j=1, 4 do
             mtx_vmul(state.to_world, state.vertices[j], 1, state.w_vertices[j])
-            vec_ma(state.center, state.w_vertices[j], 1/4, state.center)
+            vec_ma(state.center, state.w_vertices[j], 0.25, state.center)
         end
 
-        local radius = 0
+        local radius_sqr = 0
         local center = state.center
         for j=1, 4 do
-            radius = math.max(radius, vec_dist_sqr(center, state.w_vertices[j]))
+            local dist_sqr = vec_dist_sqr(center, state.w_vertices[j])
+            radius_sqr = math.max(radius_sqr, dist_sqr)
         end
-        state.radius = math.sqrt(radius)
-        local vis = util.PixelVisible(
-            Vector(unpack(center)),
-            state.radius * 2,
-            state.pixel_vis
-        )
+        state.radius = math.sqrt(radius_sqr)
+        state.visible = (not state.behind)
 
-        state.visible = vis > 0
+        if state.visible then
+
+            center_vec:SetUnpacked(unpack(center))
+
+            local vis = util.PixelVisible(
+                center_vec,
+                state.radius * 2,
+                state.pixel_vis
+            )
+
+            -- not sure why, but in the most recent update; pixelvis
+            -- diminishes toward 0 as you get closer, so override
+            -- if eye is close
+            local eye_distance = vec_dist_sqr(center, system_state.eye_pos)
+            if eye_distance < radius_sqr * 16 then vis = 1 end
+
+            state.visible = vis > 0
+
+        end
+
         state.should_render = state.visible and (not state.behind)
 
     end
@@ -1094,9 +1140,7 @@ local function process_screens(view)
 
     end
 
-    perf_start("rt_allocate")
     allocate_screen_rendertargets()
-    perf_end("rt_allocate")
 
 end
 
@@ -1116,10 +1160,10 @@ local mesh_advance = mesh.AdvanceVertex
 
 local function draw_screen_textured_quad(state)
 
-    local rt, rect = state.render_target, state.render_rect
-    if not rt or not rect then return end
+    local rt_id, rect = state.rt_id, state.rt_rect
+    if not rt_id or not rect then return end
 
-    local rt_size = RENDERTARGET_SIZE
+    local rt, rt_size = get_cached_rendertarget(rt_id)
     local x,y,w,h = rect.x, rect.y, rect.w, rect.h
 
     mesh_begin(MATERIAL_QUADS, 1)
@@ -1145,29 +1189,34 @@ end
 local clear_color = Color(0,0,0,0)
 local function draw_screens_to_rendertargets()
 
-    perf_start("rt_render")
+    if system_state.screen_index == 1 then return end
 
-    -- clear all in-use rendertargets
-    for i=1, system_state.num_render_targets do
-        local rt = system_state.render_targets[i]
-        render.ClearRenderTarget(rt, clear_color)
-    end
+    perf_start("rt_render")
 
     -- draw each screen to its designated location 
     -- within its rendertarget
+    local clear_bits = 0
     local main_rt = render.GetRenderTarget()
     local scr_w, scr_h = ScrW(), ScrH()
     local current_rt = main_rt
     for i=1, system_state.screen_index-1 do
 
         local state = screen_states[i]
-        local rt, rect = state.render_target, state.render_rect
-        if not rt then continue end
+        local rt_id, rect = state.rt_id, state.rt_rect
+        if not rt_id then continue end
 
         -- update current rendertarget
+        local rt = get_cached_rendertarget(rt_id)
         if rt ~= current_rt then
             current_rt = rt
             render.SetRenderTarget(current_rt)
+        end
+
+        -- clear rendertarget on its first write this frame
+        local rt_bit = bit.lshift(1, state.rt_id-1)
+        if bit.band(clear_bits, rt_bit) == 0 then
+            render.Clear(0, 0, 0, 0)
+            clear_bits = bit.bor(clear_bits, rt_bit)
         end
 
         -- work within allocated rectangle inside rendertarget
@@ -1190,8 +1239,10 @@ local function draw_screens_to_rendertargets()
 
     end
 
-    render.SetRenderTarget(main_rt)
-    render.SetViewPort(0, 0, scr_w, scr_h)
+    if current_rt ~= main_rt then
+        render.SetRenderTarget(main_rt)
+        render.SetViewPort(0, 0, scr_w, scr_h)
+    end
 
     perf_end("rt_render")
 
@@ -1209,9 +1260,10 @@ local function render_screens()
 
         local rt_size = RENDERTARGET_SIZE
         local state = screen_states[i]
-        local rt, rect = state.render_target, state.render_rect
-        if not rt then continue end
+        local rt_id, rect = state.rt_id, state.rt_rect
+        if not rt_id then continue end
 
+        local rt = get_cached_rendertarget(rt_id)
         local x,y,w,h = rect.x, rect.y, rect.w, rect.h
         if rt ~= last_rt_texture then
             last_rt_texture = rt
@@ -1287,12 +1339,6 @@ hook.Add("PostDrawOpaqueRenderables", "hi", function()
 
 end)
 
-hook.Add("PostRender", "hi", function()
-
-    
-
-end)
-
 hook.Add("HUDPaint", "hi", function()
 
     local y = 0
@@ -1325,19 +1371,56 @@ hook.Add("HUDPaint", "hi", function()
 
 end)
 
-hook.Add("PlayerBindPress", "hi", function(ply, bind, pressed, code)
+local function handle_binds(ply, bind, pressed, code)
 
-    if bind == "+attack" then
+    local interact = system_state.screen_interact
+    if not interact then return end
 
-        local interact = system_state.screen_interact
-        if interact then
-            system_state.down[1] = pressed
-            return true
-        end
+    if bind == "+attack" or bind == "+attack2" then
+
+        if interact.capture_mouse then return true end
+
+    elseif bind == "+use" then
+
+        if interact.capture_use then return true end
 
     end
 
-end)
+end
+
+hook.Add("PlayerBindPress", "screens_handle_binds", handle_binds)
+
+local function binding_to_key( bind )
+
+    return input.GetKeyCode( input.LookupBinding(bind) )
+
+end
+
+local function handle_inputs()
+
+    perf_start("handle_inputs")
+
+    local k_use = input.IsKeyDown( binding_to_key("+use") )
+    local k_attack1 = input.IsKeyDown( binding_to_key("+attack") )
+    local k_attack2 = input.IsKeyDown( binding_to_key("+attack2") )
+    local m_left = input.IsMouseDown(MOUSE_LEFT)
+    local m_right = input.IsMouseDown(MOUSE_RIGHT)
+
+    local interact = system_state.screen_interact
+    system_state.down[1] = k_use
+
+    if interact and interact.capture_mouse then
+        system_state.down[1] = system_state.down[1] or k_attack1 or m_left
+        system_state.down[2] = k_attack2 or m_right
+    else
+        system_state.down[2] = false
+    end
+
+    perf_end("handle_inputs")
+
+end
+
+hook.Add("Think", "screens_handle_inputs", handle_inputs)
 
 local btn_sounds = {1,2,3,4,5,6,8,9}--6,8,9,10,14,15,16,17,18,19,24}
 
@@ -1387,6 +1470,106 @@ local function create_test_panel(entity)
 
 end
 
+__screen_SENT_classes = __screen_SENT_classes or {}
+__screen_SENTS = __screen_SENTS or {}
+
+local pending_refresh_entity_list = false
+
+local function refresh_entity_list()
+
+    __screen_SENTS = {}
+    for _, ent in ents.Iterator() do
+        local class = ent:GetClass()
+        local func = __screen_SENT_classes[class]
+        if not func then continue end
+        __screen_SENTS[#__screen_SENTS+1] = {
+            ent = ent,
+            func = func,
+        }
+    end
+    print("Refreshed " .. #__screen_SENTS .. " screen entities")
+
+end
+
+local function handle_register_entity(ent_table, class)
+
+    if ent_table.ProcessScreens then
+        __screen_SENT_classes[class] = ent_table.ProcessScreens
+        print("REGISTER SCREEN ENTITY CLASS: " .. tostring(class))
+        pending_refresh_entity_list = true
+    else
+        print("UNREGISTER SCREEN ENTITY CLASS: " .. tostring(class))
+        __screen_SENT_classes[class] = nil
+        pending_refresh_entity_list = true
+    end
+
+end
+
+local function check_for_entity_list_refresh()
+
+    if pending_refresh_entity_list then
+        pending_refresh_entity_list = false
+        refresh_entity_list()
+    end
+
+end
+
+local function handle_entity_created(ent)
+
+    if not IsValid(ent) then return end
+    local func = __screen_SENT_classes[ent:GetClass()]
+    if not func then return end
+    if table.HasValue(__screen_SENTS, ent) then return end
+    __screen_SENTS[#__screen_SENTS+1] = {
+        ent = ent,
+        func = func,
+    }
+
+end
+
+local function handle_entity_removed(ent, full_update)
+
+    if full_update then return end
+    if not IsValid(ent) then return end
+    for i=#__screen_SENTS, 1, -1 do
+        if __screen_SENTS[i].ent ~= ent then continue end
+        table.remove(__screen_SENTS, i) 
+    end
+
+end
+
+local err_fmt = "Error on screen %s: \"%s\"\n"
+local function handle_process_screens_ents(api)
+
+    -- If waiting for a refresh, don't process screens
+    if pending_refresh_entity_list then return end
+    for i=1, #__screen_SENTS do
+        local entry = __screen_SENTS[i]
+        local ent = entry.ent
+        local func = entry.func
+
+        -- skip entities outside of PVS
+        if ent:IsDormant() then continue end
+
+        -- run the entity
+        system_state.current_entity = ent
+        local b,e = pcall( func, ent, api )
+        if not b then 
+            ErrorNoHalt(err_fmt:format(tostring(ent),  tostring(e))) 
+        end
+        system_state.current_entity = nil
+    end
+
+end
+
+hook.Add("OnEntityCreated", "screens_entity_created", handle_entity_created)
+hook.Add("EntityRemoved", "screens_entity_removed", handle_entity_removed)
+
+hook.Add("PreRegisterSENT", "screens_register_sent", handle_register_entity)
+hook.Add("Think", "screens_check_refresh", check_for_entity_list_refresh)
+hook.Add("ProcessScreens", "screens_process_ents", handle_process_screens_ents)
+
+
 local test_vgui = false
 local refresh_panels = true
 local lmb_material = Material("gui/lmb.png")
@@ -1395,13 +1578,15 @@ local function remove_entity_panel(ent, pnl)
 end
 hook.Add("ProcessScreens", "hi", function(s)
 
+    if true then return end
+
     local do_refresh = refresh_panels
     refresh_panels = false
 
     local t = CurTime()
     for _, ent in ents.Iterator() do
         if ent:IsDormant() then continue end
-        if ent:GetClass() ~= "prop_physics" then continue end
+        --if ent:GetClass() ~= "prop_physics" then continue end
         if ent:GetModel() == "models/blacknecro/tv_plasma_4_3.mdl" then
 
             if do_refresh then
