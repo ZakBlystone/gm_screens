@@ -1,4 +1,3 @@
---if true then return end
 
 if SERVER then
     AddCSLuaFile()
@@ -44,7 +43,7 @@ local function mtx_vmul(m, v, w, o)
 
 end
 
-function atlas_packer(w, h, pad)
+local function atlas_packer(w, h, pad)
 
 	pad = pad or 0
     local free = { x=0, y=0, w=w, h=h }
@@ -1422,54 +1421,6 @@ end
 
 hook.Add("Think", "screens_handle_inputs", handle_inputs)
 
-local btn_sounds = {1,2,3,4,5,6,8,9}--6,8,9,10,14,15,16,17,18,19,24}
-
-local function create_test_panel(entity)
-
-    local panel = vgui.Create("DPanel")
-    panel.xres, panel.yres = 800, 600
-    panel:SetBackgroundColor(Color(20,20,20))
-    panel:SetSize(200,200)
-    panel.entity = entity
-    
-    local res = vgui.Create("DPanel", panel)
-    res:SetTall(50)
-    res:Dock(TOP)
-
-    local function make_res(w,h)
-        local res = vgui.Create("DButton", res)
-        res:SetFont("DermaLarge")
-        res:DockMargin(4,4,4,4)
-        res:Dock(LEFT)
-        res:SetText(w .. "x" .. h)
-        res:SizeToContents()
-        res.DoClick = function() panel.xres, panel.yres = w,h end
-    end
-
-    make_res(800,600)
-    make_res(400,300)
-    make_res(600,300)
-
-    local scroll = vgui.Create("DScrollPanel", panel)
-    scroll:Dock(FILL)
-    scroll.VBar:SetWide(32)
-    
-    for i=1, #btn_sounds do
-        local btn = vgui.Create("DButton")
-        btn:SetText("button" .. btn_sounds[i] .. ".wav")
-        btn:SetFont("DermaLarge")
-        btn.DoClick = function()
-            panel.entity:EmitSound("buttons/button" .. btn_sounds[i] .. ".wav")
-        end
-        btn:SetTall(48)
-        scroll:AddItem(btn)
-        btn:Dock(TOP)
-    end
-
-    return panel
-
-end
-
 __screen_SENT_classes = __screen_SENT_classes or {}
 __screen_SENTS = __screen_SENTS or {}
 
@@ -1568,106 +1519,3 @@ hook.Add("EntityRemoved", "screens_entity_removed", handle_entity_removed)
 hook.Add("PreRegisterSENT", "screens_register_sent", handle_register_entity)
 hook.Add("Think", "screens_check_refresh", check_for_entity_list_refresh)
 hook.Add("ProcessScreens", "screens_process_ents", handle_process_screens_ents)
-
-
-local test_vgui = false
-local refresh_panels = true
-local lmb_material = Material("gui/lmb.png")
-local function remove_entity_panel(ent, pnl)
-    pnl:Remove()
-end
-hook.Add("ProcessScreens", "hi", function(s)
-
-    if true then return end
-
-    local do_refresh = refresh_panels
-    refresh_panels = false
-
-    local t = CurTime()
-    for _, ent in ents.Iterator() do
-        if ent:IsDormant() then continue end
-        --if ent:GetClass() ~= "prop_physics" then continue end
-        if ent:GetModel() == "models/blacknecro/tv_plasma_4_3.mdl" then
-
-            if do_refresh then
-                if IsValid(ent.test_panel) then 
-                    ent.test_panel:Remove()
-                    ent.test_panel = nil
-                end
-            end
-
-            if not ent.test_panel and test_vgui then
-                local pnl = create_test_panel(ent)
-                if IsValid(pnl) then
-                    ent.test_panel = pnl
-                    ent:CallOnRemove("RemoveMyPanel", 
-                    remove_entity_panel,
-                    pnl)
-                end
-            end
-
-            if s.start(ent:GetPos(), ent:GetAngles(), 56, 43, ent) then
-                s.set_res(800/2,600/2)
-                if IsValid(ent.test_panel) then
-                    s.set_res(ent.test_panel.xres, ent.test_panel.yres)
-                end
-                s.set_anchor(0.5,0.5,0.5)
-
-                local w,h = s.get_res()
-                if test_vgui then 
-                    s.vgui(ent.test_panel)
-                end
-                s.set_color(10,20,60,180)
-                s.rect(0,0,w,h)
-
-                if not s.is_interacting() then
-                    local r = 255 * (math.cos(t + ent:EntIndex()) + 1)/2
-                    s.set_color(r,0,0,180)
-                    s.rect(0,0,w,h)
-                end
-
-                if test_vgui then 
-                    s.set_color(0,0,0)
-                else
-                    s.set_color(255,255,255)
-                end
-                s.text("id: " .. ent:EntIndex(), 10, h-30)
-                if not test_vgui then
-                    s.set_font("DermaLarge")
-                    s.text_center("HELLO", w/2, h/2)
-                end
-            end
-
-            s.finish()
-
-        end
-    end
-
-end)
-
---[[local x,y = s.get_cursor()
-local w,h = s.get_res()
-local interact = s.is_interacting()
-if s.is_pressed(1) then
-    ent.__toggle = not ent.__toggle
-    ent:EmitSound("buttons/button1.wav")
-end
-s.set_color(46,80,120)
-if ent.__toggle then 
-    s.set_color(165,74,71)
-    if interact then s.set_color(80,20,20) end
-elseif interact then
-    s.set_color(73,197,129)
-end
-s.rect(0,0,w,h)
-if interact then
-    s.set_color(255,255,255)
-    s.image(x-20,y-20,40,40,lmb_material)
-end
-s.set_font("DermaLarge")
-s.set_color(255,255,255)
-s.text_center("Toggled: " .. tostring(ent.__toggle or false), w/2, h/2)
-
-for i=1, 30 do
-    s.rect(i*10, 20 + math.sin(t*4+i) * 10, 8, 8)
-end]]
