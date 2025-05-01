@@ -6,6 +6,9 @@ end
 
 module("screens", package.seeall)
 
+local cvar_show_debug = CreateConVar("cl_debugscreens", "0")
+local function should_show_debug() return cvar_show_debug:GetBool() end
+
 local function vec_new() return {0,0,0} end
 local function vec_set(v, ...) v[1], v[2], v[3] = ... end
 local function vec_dot(a, b) return a[1] * b[1] + a[2] * b[2] + a[3] * b[3] end
@@ -1279,7 +1282,7 @@ local function render_screens()
 
 end
 
-hook.Add("PreRender", "hi", function()
+hook.Add("PreRender", "screens_prerender", function()
 
     system_state.sorted_perf_stats = {}
 
@@ -1315,7 +1318,7 @@ hook.Add("PreRender", "hi", function()
 
 end)
 
-hook.Add("PostDrawOpaqueRenderables", "hi", function()
+hook.Add("PostDrawOpaqueRenderables", "screens_drawopaque", function()
 
     local view = render.GetViewSetup()
     if view.viewid == VIEW_3DSKY then return end
@@ -1338,7 +1341,9 @@ hook.Add("PostDrawOpaqueRenderables", "hi", function()
 
 end)
 
-hook.Add("HUDPaint", "hi", function()
+hook.Add("HUDPaint", "screens_hudpaint", function()
+
+    if not should_show_debug() then return end
 
     local y = 0
     local function count(name, num)
